@@ -1,5 +1,7 @@
 """Unit coverage for the strict failed-check recovery boundary."""
 
+import pytest
+
 from agent_ops.audit.receipts import write_receipt
 from agent_ops.audit.report import build_audit_report, render_audit_report
 from agent_ops.contracts import ActionReceiptV1, CheckResultV1
@@ -29,6 +31,34 @@ def test_recovery_rejects_empty_malformed_unknown_and_duplicate_initial_results(
     wrong_subject = _check("unit", "HOLD", "exit=1")
     wrong_subject.subject_ref = "b" * 40
     assert not repairable([wrong_subject])
+
+
+def test_recovery_rejects_unsafe_reserved_and_colliding_check_ids():
+    repairable = lambda checks: initial_failure_is_repairable(
+        checks, expected_subject_ref="a" * 40
+    )
+    assert not repairable([_check("unit check", "HOLD", "exit=1")])
+    assert not repairable([_check("recovery.unit", "HOLD", "exit=1")])
+    assert not repairable([_check("Recovery.unit", "HOLD", "exit=1")])
+    assert not repairable([_check("u" * 120, "HOLD", "exit=1")])
+
+    initial = [
+        _check("unit", "HOLD", "exit=1"),
+        _check("recovery.unit", "PASS", "exit=0"),
+    ]
+    final = [
+        _check("unit", "PASS", "exit=0"),
+        _check("recovery.unit", "PASS", "exit=0"),
+    ]
+    for check in final:
+        check.subject_ref = "b" * 40
+    with pytest.raises(ValueError, match="recovery_evidence_invalid"):
+        recovery_markers(
+            initial,
+            final,
+            initial_candidate_sha="a" * 40,
+            final_reviewer_sha="b" * 40,
+        )
 
 
 def test_recovery_markers_require_exact_final_ids_and_public_safe_evidence():

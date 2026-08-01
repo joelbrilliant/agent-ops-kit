@@ -15,6 +15,7 @@ from agent_ops.config import RepoPolicy
 from agent_ops.audit.report import build_audit_report
 from agent_ops.github.client import FakeGitHub
 from agent_ops.github.discovery import fetch_pr_threads
+from agent_ops.maintenance import review_fix as review_fix_module
 from agent_ops.maintenance.ledger import Ledger
 from agent_ops.maintenance.orchestrator import set_paused, sweep
 from agent_ops.maintenance.worktree import base_is_ancestor, push_head_no_force
@@ -400,6 +401,155 @@ def test_unrepaired_final_check_opens_circuit_without_github_mutation(tmp_path: 
     assert Ledger(cfg.state_dir / "ledger.sqlite3").circuit_open()
 
 
+def test_final_failure_receipt_uses_final_reviewer_check_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    counter = tmp_path / "verification-count.txt"
+    cfg = make_config(
+        tmp_path,
+        default_verification_commands={
+            "unit": [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    f"p=Path({str(counter)!r}); "
+                    "n=int(p.read_text()) + 1 if p.exists() else 1; "
+                    "p.write_text(str(n)); raise SystemExit(n)"
+                ),
+            ]
+        },
+    )
+    captured = []
+    original_receipt = review_fix_module._receipt
+
+    def capture_receipt(*args, **kwargs):
+        captured.append(
+            [
+                (check.check_id, check.status, check.summary)
+                for check in kwargs["checks"]
+            ]
+        )
+        return original_receipt(*args, **kwargs)
+
+    monkeypatch.setattr(review_fix_module, "_receipt", capture_receipt)
+    fake = FakeGitHub()
+    _pr, remote, original_sha, ref = _wire_real_remote(tmp_path, fake)
+
+    outcome = sweep(cfg, client=fake)
+
+    assert outcome.exit_code == 1
+    assert "final_verification_failed" in outcome.message
+    assert captured[-1] == [("unit", "HOLD", "exit=2")]
+    assert not fake.replies
+    assert _remote_ref(remote, ref) == original_sha
+
+
+def test_recovery_requires_a_committed_reviewer_change(tmp_path: Path):
+    counter = tmp_path / "verification-count.txt"
+    cfg = make_config(
+        tmp_path,
+        default_verification_commands={
+            "unit": [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path; "
+                    f"p=Path({str(counter)!r}); "
+                    "n=int(p.read_text()) + 1 if p.exists() else 1; "
+                    "p.write_text(str(n)); raise SystemExit(1 if n == 1 else 0)"
+                ),
+            ]
+        },
+    )
+    fake = FakeGitHub()
+    _pr, remote, original_sha, ref = _wire_real_remote(tmp_path, fake)
+
+    outcome = sweep(cfg, client=fake)
+
+    assert outcome.exit_code == 1
+    assert "reviewer_recovery_missing_committed_change" in outcome.message
+    receipt = json.loads(outcome.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "held"
+    assert receipt["named_checks"] == ["unit"]
+    assert counter.read_text(encoding="utf-8") == "2"
+    assert not fake.replies
+    assert _remote_ref(remote, ref) == original_sha
+
+
+def test_recovery_reviewer_cannot_rewrite_the_exact_candidate(tmp_path: Path):
+    cfg = make_config(
+        tmp_path,
+        default_verification_commands={
+            "unit": [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; raise SystemExit(0 if '# reviewer' in Path('demo.txt').read_text() else 1)",
+            ]
+        },
+    )
+    reviewer = Path(cfg.reviewer_command[1])
+    reviewer.write_text(
+        """#!/usr/bin/env python3
+import json, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+def get(flag): return Path(args[args.index(flag) + 1])
+request = json.loads(get('--request').read_text())
+worktree = get('--worktree')
+subprocess.run(['git', 'reset', '--hard', request['base_sha']], cwd=worktree, check=True)
+(worktree / 'demo.txt').write_text((worktree / 'demo.txt').read_text() + '# reviewer\\n')
+subprocess.run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=worktree, check=True)
+subprocess.run(['git', 'config', 'user.name', 'Test Oscar'], cwd=worktree, check=True)
+subprocess.run(['git', 'add', 'demo.txt'], cwd=worktree, check=True)
+subprocess.run(['git', 'commit', '-m', 'fix: rewritten repair'], cwd=worktree, check=True)
+head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip()
+get('--response').write_text(json.dumps({
+    'schema': 'ReviewerResponseV1',
+    'runner_identity': {'profile': 'oscar', 'provider': 'openai-codex', 'model': 'gpt-5.6-sol', 'reasoning_effort': 'xhigh', 'service_tier': 'fast', 'session_id': 'rewriting-review-session', 'fresh_session': True},
+    'reviewed_sha': request['candidate_sha'], 'resulting_sha': head, 'verdict': 'PASS', 'findings': [], 'fixes': ['rewritten repair'],
+    'reply_draft': 'fixed at ' + head + '. checks: unit',
+    'voice_gate': {'schema': 'VoiceGateV1', 'shared_operator_contract_read': True, 'operator_profile_read': True, 'skill': 'joel-voice-writing', 'reference': 'references/voice.md', 'register': 'public-community-short-reply', 'passed': True},
+}))
+""",
+        encoding="utf-8",
+    )
+    fake = FakeGitHub()
+    _pr, remote, original_sha, ref = _wire_real_remote(tmp_path, fake)
+
+    outcome = sweep(cfg, client=fake)
+
+    assert outcome.exit_code == 1
+    assert "reviewer_recovery_rewrote_candidate" in outcome.message
+    assert not fake.replies
+    assert _remote_ref(remote, ref) == original_sha
+
+
+def test_reserved_recovery_check_id_holds_before_reviewer_and_mutation(tmp_path: Path):
+    cfg = make_config(
+        tmp_path,
+        default_verification_commands={
+            "unit": [sys.executable, "-c", "raise SystemExit(1)"],
+            "recovery.unit": [sys.executable, "-c", "pass"],
+        },
+    )
+    fake = FakeGitHub()
+    _pr, remote, original_sha, ref = _wire_real_remote(tmp_path, fake)
+
+    outcome = sweep(cfg, client=fake)
+
+    assert outcome.exit_code == 1
+    assert "builder_verification_failed" in outcome.message
+    assert not list((cfg.state_dir / "requests").glob("*review-request.json"))
+    receipt = json.loads(outcome.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["named_checks"] == ["unit", "recovery.unit"]
+    report = build_audit_report(cfg)
+    assert len(report.items) == 1
+    assert report.items[0]["named_checks"] == ["recovery.unit", "unit"]
+    assert not fake.replies
+    assert _remote_ref(remote, ref) == original_sha
+
+
 def _run_pr_failed_check_recovery(tmp_path: Path):
     cfg = make_config(
         tmp_path,
@@ -459,6 +609,9 @@ def test_pr_failed_check_reaches_fresh_reviewer_and_recovers_once(tmp_path: Path
         }
     ) == 2
     assert len(fake.replies) == 1
+    report = build_audit_report(cfg)
+    assert report.verdict == "PASS"
+    assert report.items[0]["named_checks"] == ["recovery.unit", "unit"]
 
 
 def test_recovery_still_uses_exactly_two_fresh_sessions(tmp_path: Path):
@@ -493,6 +646,37 @@ def test_verification_mutation_never_reaches_reviewer(tmp_path: Path, exit_code:
 
     assert outcome.exit_code == 1
     assert "runner_left_dirty_worktree" in outcome.message
+    assert Ledger(cfg.state_dir / "ledger.sqlite3").circuit_open()
+    assert not list((cfg.state_dir / "requests").glob("*review-request.json"))
+    assert not fake.replies
+    assert _remote_ref(remote, ref) == original_sha
+
+
+@pytest.mark.parametrize("mode", ["start", "timeout", "signal", "empty"])
+def test_non_normal_verification_failures_never_reach_reviewer(
+    tmp_path: Path, mode: str
+):
+    commands = {
+        "start": [str(tmp_path / "missing-verifier")],
+        "timeout": [sys.executable, "-c", "import time; time.sleep(2)"],
+        "signal": [
+            sys.executable,
+            "-c",
+            "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+        ],
+        "empty": [],
+    }
+    cfg = make_config(
+        tmp_path,
+        default_verification_commands={"unit": commands[mode]},
+        runner_timeout_seconds=1,
+    )
+    fake = FakeGitHub()
+    _pr, remote, original_sha, ref = _wire_real_remote(tmp_path, fake)
+
+    outcome = sweep(cfg, client=fake)
+
+    assert outcome.exit_code == 1
     assert Ledger(cfg.state_dir / "ledger.sqlite3").circuit_open()
     assert not list((cfg.state_dir / "requests").glob("*review-request.json"))
     assert not fake.replies

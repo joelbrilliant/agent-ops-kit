@@ -10,8 +10,10 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from agent_ops.audit.report import build_audit_report
 from agent_ops.config import RunnerIdentityPolicy
 from agent_ops.github.client import FakeGitHub
+from agent_ops.maintenance import issue_fix as issue_fix_module
 from agent_ops.maintenance.issue_fix import _branch_name, inspect_issue_work, issue_sweep
 from agent_ops.runners.runner import write_owner_only_json
 from tests.conftest import sys_executable, write_executable
@@ -458,6 +460,134 @@ def test_issue_job_holds_on_failing_verification(tmp_path: Path):
     assert "agent-ops/issue" not in refs
 
 
+def test_issue_final_failure_receipt_uses_final_reviewer_check_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cfg, fake, _issue, bare, _sha, _head = _base_fixture(tmp_path)
+    counter = tmp_path / "verification-count.txt"
+    cfg.repository_policies["operator/demo"].verification_commands["unit"] = [
+        sys_executable(),
+        "-c",
+        (
+            "from pathlib import Path; "
+            f"p=Path({str(counter)!r}); "
+            "n=int(p.read_text()) + 1 if p.exists() else 1; "
+            "p.write_text(str(n)); raise SystemExit(n)"
+        ),
+    ]
+    captured = []
+    original_receipt = issue_fix_module._receipt
+
+    def capture_receipt(*args, **kwargs):
+        captured.append(
+            [
+                (check.check_id, check.status, check.summary)
+                for check in kwargs["checks"]
+            ]
+        )
+        return original_receipt(*args, **kwargs)
+
+    monkeypatch.setattr(issue_fix_module, "_receipt", capture_receipt)
+
+    outcome = issue_sweep(cfg, client=fake)
+
+    assert outcome.exit_code != 0
+    assert "final_verification_failed" in outcome.message
+    assert captured[-1] == [("unit", "HOLD", "exit=2")]
+    assert not fake.created_pulls
+    refs = subprocess.run(
+        ["git", "ls-remote", "--heads", str(bare)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "agent-ops/issue" not in refs
+
+
+def test_issue_recovery_requires_a_committed_reviewer_change(tmp_path: Path):
+    cfg, fake, _issue, bare, _sha, _head = _base_fixture(tmp_path)
+    counter = tmp_path / "verification-count.txt"
+    cfg.repository_policies["operator/demo"].verification_commands["unit"] = [
+        sys_executable(),
+        "-c",
+        (
+            "from pathlib import Path; "
+            f"p=Path({str(counter)!r}); "
+            "n=int(p.read_text()) + 1 if p.exists() else 1; "
+            "p.write_text(str(n)); raise SystemExit(1 if n == 1 else 0)"
+        ),
+    ]
+
+    outcome = issue_sweep(cfg, client=fake)
+
+    assert outcome.exit_code != 0
+    assert "reviewer_recovery_missing_committed_change" in outcome.message
+    receipt = json.loads(outcome.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "held"
+    assert receipt["named_checks"] == ["unit"]
+    assert counter.read_text(encoding="utf-8") == "2"
+    assert not fake.created_pulls
+    assert not fake.created_issue_comments
+    refs = subprocess.run(
+        ["git", "ls-remote", "--heads", str(bare)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "agent-ops/issue" not in refs
+
+
+def test_issue_recovery_reviewer_cannot_rewrite_the_exact_candidate(tmp_path: Path):
+    cfg, fake, _issue, bare, _sha, _head = _base_fixture(tmp_path)
+    assert cfg.issue_automation is not None
+    cfg.repository_policies["operator/demo"].verification_commands["unit"] = [
+        sys_executable(),
+        "-c",
+        "from pathlib import Path; raise SystemExit(0 if '# reviewer' in Path('demo.txt').read_text() else 1)",
+    ]
+    reviewer = Path(cfg.issue_automation.reviewer_command[1])
+    reviewer.write_text(
+        """#!/usr/bin/env python3
+import json, subprocess, sys
+from pathlib import Path
+args = sys.argv[1:]
+def get(flag): return Path(args[args.index(flag) + 1])
+request = json.loads(get('--request').read_text())
+worktree = get('--worktree')
+subprocess.run(['git', 'reset', '--hard', request['base_sha']], cwd=worktree, check=True)
+(worktree / 'demo.txt').write_text((worktree / 'demo.txt').read_text() + '# reviewer\\n')
+subprocess.run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=worktree, check=True)
+subprocess.run(['git', 'config', 'user.name', 'Test Oscar'], cwd=worktree, check=True)
+subprocess.run(['git', 'add', 'demo.txt'], cwd=worktree, check=True)
+subprocess.run(['git', 'commit', '-m', 'fix: rewritten repair'], cwd=worktree, check=True)
+head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip()
+get('--response').write_text(json.dumps({
+    'schema': 'IssueReviewerResponseV1',
+    'runner_identity': {'profile': 'review', 'provider': 'openai-codex', 'model': 'gpt-5.6-sol', 'reasoning_effort': 'xhigh', 'service_tier': 'fast', 'session_id': 'rewriting-review-session', 'fresh_session': True},
+    'reviewed_sha': request['candidate_sha'], 'resulting_sha': head, 'verdict': 'PASS', 'findings': [], 'fixes': ['rewritten repair'],
+    'reply_draft': 'Fixed at ' + head + '. checks: unit. {draft_pr_url}',
+    'pr_title': 'fix after review', 'pr_body': 'Closes #7',
+    'voice_gate': {'schema': 'VoiceGateV1', 'shared_operator_contract_read': True, 'operator_profile_read': True, 'skill': 'joel-voice-writing', 'reference': 'references/voice.md', 'register': 'public-community-short-reply', 'passed': True},
+}))
+""",
+        encoding="utf-8",
+    )
+
+    outcome = issue_sweep(cfg, client=fake)
+
+    assert outcome.exit_code != 0
+    assert "reviewer_recovery_rewrote_candidate" in outcome.message
+    assert not fake.created_pulls
+    assert not fake.created_issue_comments
+    refs = subprocess.run(
+        ["git", "ls-remote", "--heads", str(bare)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "agent-ops/issue" not in refs
+
+
 def test_issue_failed_check_reaches_fresh_reviewer_and_recovers_once(tmp_path: Path):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -553,6 +683,20 @@ def test_issue_failed_check_reaches_fresh_reviewer_and_recovers_once(tmp_path: P
     assert receipt["resulting_sha"] != sha
     assert receipt["named_checks"] == ["unit", "recovery.unit"]
     assert verification_counter.read_text(encoding="utf-8") == "xx"
+    responses = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (cfg.state_dir / "requests").glob("*-response.json")
+    ]
+    fresh = [
+        response["runner_identity"]
+        for response in responses
+        if response["runner_identity"]["fresh_session"]
+    ]
+    assert len(fresh) == 2
+    assert len({identity["session_id"] for identity in fresh}) == 2
+    report = build_audit_report(cfg)
+    assert report.verdict == "PASS"
+    assert report.items[0]["named_checks"] == ["recovery.unit", "unit"]
 
 
 def test_issue_job_holds_when_issue_changes_before_push(tmp_path: Path):

@@ -9,6 +9,8 @@ from agent_ops.contracts import CheckResultV1
 
 
 _POSITIVE_EXIT = re.compile(r"^exit=[1-9][0-9]*$")
+_PUBLIC_CHECK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_RECOVERY_PREFIX = "recovery."
 
 
 def initial_failure_is_repairable(
@@ -20,9 +22,16 @@ def initial_failure_is_repairable(
     check_ids = []
     held = False
     for check in checks:
+        marker_id = (
+            _RECOVERY_PREFIX + check.check_id
+            if isinstance(check.check_id, str)
+            else ""
+        )
         if (
             not isinstance(check.check_id, str)
-            or not check.check_id
+            or not _PUBLIC_CHECK_ID.fullmatch(check.check_id)
+            or check.check_id.casefold().startswith(_RECOVERY_PREFIX)
+            or not _PUBLIC_CHECK_ID.fullmatch(marker_id)
             or check.subject_ref != expected_subject_ref
             or not isinstance(check.status, str)
             or not isinstance(check.summary, str)
@@ -71,9 +80,9 @@ def recovery_markers(
         )
     ):
         raise ValueError("recovery_evidence_invalid")
-    return [
+    markers = [
         CheckResultV1(
-            check_id="recovery." + initial.check_id,
+            check_id=_RECOVERY_PREFIX + initial.check_id,
             subject_ref=final_reviewer_sha,
             status="PASS",
             summary="recovered_after_review",
@@ -82,3 +91,7 @@ def recovery_markers(
         for initial, final in zip(initial_checks, final_checks)
         if initial.status == "HOLD"
     ]
+    final_ids = {check.check_id for check in final_checks}
+    if any(marker.check_id in final_ids for marker in markers):
+        raise ValueError("recovery_check_id_collision")
+    return markers

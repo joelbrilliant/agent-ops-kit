@@ -530,6 +530,10 @@ def run_claimed_job(
             raise RunnerContractError("reviewer_resulting_sha_mismatch")
         if reviewer.verdict != "PASS":
             raise RunnerContractError("reviewer_hold")
+        if recovery_required and not base_is_ancestor(
+            config.git_command, worktree, candidate_sha
+        ):
+            raise RunnerContractError("reviewer_recovery_rewrote_candidate")
 
         ledger.mark_phase(job_id, "final_verifying")
         final_checks = run_named_verifications(
@@ -538,11 +542,16 @@ def run_claimed_job(
             subject_ref=resulting_sha,
             timeout=config.runner_timeout_seconds,
         )
-        if not all_passed(final_checks):
-            raise RunnerContractError("final_verification_failed")
+        checks = list(final_checks)
         if not final_check_ids_match(initial_verification_checks, final_checks):
             raise RunnerContractError("final_verification_check_ids_changed")
-        checks = list(final_checks)
+        if not all_passed(final_checks):
+            raise RunnerContractError("final_verification_failed")
+        if recovery_required and (
+            resulting_sha == candidate_sha
+            or not changed_files(config.git_command, worktree, candidate_sha)
+        ):
+            raise RunnerContractError("reviewer_recovery_missing_committed_change")
         completed_receipt_checks = list(final_checks)
         if recovery_required:
             completed_receipt_checks.extend(

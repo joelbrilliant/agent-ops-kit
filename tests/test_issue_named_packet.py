@@ -458,7 +458,7 @@ def test_issue_job_holds_on_failing_verification(tmp_path: Path):
     assert "agent-ops/issue" not in refs
 
 
-def test_issue_reviewer_fix_is_reverified(tmp_path: Path):
+def test_issue_failed_check_reaches_fresh_reviewer_and_recovers_once(tmp_path: Path):
     scripts = tmp_path / "scripts"
     scripts.mkdir()
     reviewer = _write_script(
@@ -519,7 +519,8 @@ def test_issue_reviewer_fix_is_reverified(tmp_path: Path):
         (
             "from pathlib import Path; "
             f"p=Path({str(verification_counter)!r}); "
-            "p.write_text((p.read_text() if p.exists() else '') + 'x')"
+            "p.write_text((p.read_text() if p.exists() else '') + 'x'); "
+            "raise SystemExit(0 if '# reviewer' in Path('demo.txt').read_text() else 1)"
         ),
     ]
     cfg.issue_automation.reviewer_command[:] = [
@@ -550,6 +551,7 @@ def test_issue_reviewer_fix_is_reverified(tmp_path: Path):
     ).stdout
     assert receipt["resulting_sha"] in refs
     assert receipt["resulting_sha"] != sha
+    assert receipt["named_checks"] == ["unit", "recovery.unit"]
     assert verification_counter.read_text(encoding="utf-8") == "xx"
 
 

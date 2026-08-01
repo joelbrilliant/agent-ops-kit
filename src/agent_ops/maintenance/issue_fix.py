@@ -50,6 +50,11 @@ from agent_ops.maintenance.worktree import (
 )
 from agent_ops.paths import is_path_allowed, is_safe_repo_path, normalize_repo_path
 from agent_ops.process import RunnerError
+from agent_ops.qa.recovery import (
+    final_check_ids_match,
+    initial_failure_is_repairable,
+    recovery_markers,
+)
 from agent_ops.qa.verify import all_passed, run_named_verifications
 from agent_ops.runners.runner import (
     RunnerContractError,
@@ -796,8 +801,7 @@ def run_claimed_issue_job(
             timeout=config.runner_timeout_seconds,
             env=build_environment,
         )
-        if not all_passed(checks):
-            raise RunnerContractError("builder_verification_failed")
+        initial_verification_checks = checks
         verified_candidate_sha, candidate_paths = _validate_local_candidate(
             config,
             worktree,
@@ -813,6 +817,11 @@ def run_claimed_issue_job(
         _assert_public_candidate_safe(
             config, signal, worktree, signal.observed_base_sha, candidate_paths
         )
+        recovery_required = not all_passed(initial_verification_checks)
+        if recovery_required and not initial_failure_is_repairable(
+            initial_verification_checks, expected_subject_ref=candidate_sha
+        ):
+            raise RunnerContractError("builder_verification_failed")
 
         ledger.mark_phase(job_id, "reviewing")
         prove_github_capability_isolation(
@@ -860,15 +869,17 @@ def run_claimed_issue_job(
             raise RunnerContractError("reviewer_hold")
 
         ledger.mark_phase(job_id, "final_verifying")
-        checks = run_named_verifications(
+        final_checks = run_named_verifications(
             verification_commands,
             cwd=worktree,
             subject_ref=resulting_sha,
             timeout=config.runner_timeout_seconds,
             env=review_environment,
         )
-        if not all_passed(checks):
+        if not all_passed(final_checks):
             raise RunnerContractError("final_verification_failed")
+        if not final_check_ids_match(initial_verification_checks, final_checks):
+            raise RunnerContractError("final_verification_check_ids_changed")
         final_verified_sha, resulting_paths = _validate_local_candidate(
             config,
             worktree,
@@ -883,7 +894,18 @@ def run_claimed_issue_job(
         _assert_public_candidate_safe(
             config, signal, worktree, signal.observed_base_sha, resulting_paths
         )
-        check_ids = [check.check_id for check in checks]
+        checks = list(final_checks)
+        completed_receipt_checks = list(final_checks)
+        if recovery_required:
+            completed_receipt_checks.extend(
+                recovery_markers(
+                    initial_verification_checks,
+                    final_checks,
+                    initial_candidate_sha=candidate_sha,
+                    final_reviewer_sha=resulting_sha,
+                )
+            )
+        check_ids = [check.check_id for check in final_checks]
         _validate_reply_draft(
             reviewer.reply_draft,
             resulting_sha,
@@ -1000,7 +1022,7 @@ def run_claimed_issue_job(
             config,
             signal=signal,
             outcome="completed",
-            checks=checks,
+            checks=completed_receipt_checks,
             resulting_sha=resulting_sha,
             hold_reason=None,
             branch_name=branch,

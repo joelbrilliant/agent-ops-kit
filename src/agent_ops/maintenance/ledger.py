@@ -631,3 +631,27 @@ class Ledger:
                 "recorded_at = ? WHERE thread_id = ?",
                 (status, error, joel_summary or None, now, thread_id),
             )
+
+    def has_completed_notification_action(
+        self,
+        repository: str,
+        pr_number: int,
+        head_sha: str,
+    ) -> bool:
+        """Return true when this exact PR head was already handled terminally."""
+        if not repository or int(pr_number or 0) <= 0 or not head_sha:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM claims
+                WHERE lower(repository) = lower(?)
+                  AND pr_number = ?
+                  AND thread_node_id LIKE 'notification:%'
+                  AND status = 'completed'
+                  AND (observed_head_sha = ? OR resulting_sha = ?)
+                LIMIT 1
+                """,
+                (repository, int(pr_number), head_sha, head_sha),
+            ).fetchone()
+            return row is not None

@@ -47,6 +47,42 @@ def test_atomic_duplicate_claim(tmp_path: Path):
     assert detail in ("claimed", "running", "completed", "held")
 
 
+def test_completed_notification_action_matches_observed_or_resulting_head(
+    tmp_path: Path,
+) -> None:
+    ledger = Ledger(tmp_path / "l.sqlite3")
+    observed = "a" * 40
+    resulting = "b" * 40
+    claim_key = make_claim_key(
+        "Operator/Demo",
+        7,
+        "notification:thread-1",
+        "2026-08-02T07:00:00Z:attempt:1",
+        observed,
+    )
+    result, job_id, _ = ledger.try_claim(
+        repository="Operator/Demo",
+        pr_number=7,
+        thread_node_id="notification:thread-1",
+        latest_comment_node_id="2026-08-02T07:00:00Z:attempt:1",
+        observed_head_sha=observed,
+        signal_digest=claim_key,
+        reclaim_after_seconds=3600,
+    )
+    assert result == "claimed" and job_id
+    ledger.complete_job(
+        job_id,
+        claim_key,
+        outcome="completed",
+        resulting_sha=resulting,
+    )
+
+    assert ledger.has_completed_notification_action("operator/demo", 7, observed)
+    assert ledger.has_completed_notification_action("operator/demo", 7, resulting)
+    assert not ledger.has_completed_notification_action("operator/demo", 7, "c" * 40)
+    assert not ledger.has_completed_notification_action("operator/demo", 8, observed)
+
+
 def test_single_active_job(tmp_path: Path):
     led = Ledger(tmp_path / "l.sqlite3")
     r1, j1, _ = led.try_claim(

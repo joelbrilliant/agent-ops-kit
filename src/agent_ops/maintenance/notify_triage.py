@@ -223,6 +223,21 @@ def _load_pr_rest(client: GitHubClient, repository: str, number: int) -> Dict[st
     return data
 
 
+def _current_pr_head_sha(
+    client: GitHubClient,
+    repository: str,
+    pr_number: int,
+) -> str:
+    """Return the current PR head when GitHub can prove it."""
+    if not repository or int(pr_number or 0) <= 0:
+        return ""
+    try:
+        pull = _load_pr_rest(client, repository, int(pr_number))
+    except (GitHubError, ValueError):
+        return ""
+    return str((pull.get("head") or {}).get("sha") or "")
+
+
 def _load_issue_comment(client: GitHubClient, url: str) -> Optional[Dict[str, Any]]:
     if not url:
         return None
@@ -1258,6 +1273,16 @@ def triage_notifications(
         return outcome
 
     notes = collect_notifications(github, config, include_read=False, ledger=ledger)
+    notes.sort(
+        key=lambda note: 0
+        if (
+            (prior := ledger.get_notification(note.thread_id))
+            and prior.get("updated_at") == note.updated_at
+            and prior.get("status") in {"pending_action", "running_action"}
+            and int(prior.get("action_attempts") or 0) > 0
+        )
+        else 1
+    )
     items: List[NotifyTriageItem] = []
     acted = 0
     dismissed = 0
@@ -1266,6 +1291,7 @@ def triage_notifications(
     sweep_triggered = False
     exit_code = OK
     messages: List[str] = []
+    action_pr_states: Dict[Tuple[str, int], str] = {}
 
     for note in notes:
         prior = ledger.get_notification(note.thread_id)
@@ -1353,9 +1379,48 @@ def triage_notifications(
             acted += 1
             if not already_queued:
                 _record_pending_action(ledger, note, decision)
+            repository = decision.related_repository or note.repository
+            pr_number = int(decision.related_pr_number or 0)
+            action_key = (repository.lower(), pr_number)
+            prior_action_state = action_pr_states.get(action_key)
+            if prior_action_state == "terminal":
+                mark_status = _record_and_maybe_mark(
+                    ledger=ledger,
+                    github=github,
+                    note=note,
+                    decision=_decision_with_mark(decision),
+                    want_mark=config.notification_triage.mark_read_on_action,
+                )
+                if mark_status != "processed":
+                    exit_code = max(exit_code, HELD)
+                messages.append("action:coalesced")
+                continue
+            if prior_action_state == "pending":
+                messages.append("action:coalesced_pending")
+                continue
+            current_head = _current_pr_head_sha(github, repository, pr_number)
+            if current_head and ledger.has_completed_notification_action(
+                repository,
+                pr_number,
+                current_head,
+            ):
+                action_pr_states[action_key] = "terminal"
+                mark_status = _record_and_maybe_mark(
+                    ledger=ledger,
+                    github=github,
+                    note=note,
+                    decision=_decision_with_mark(decision),
+                    want_mark=config.notification_triage.mark_read_on_action,
+                )
+                if mark_status != "processed":
+                    exit_code = max(exit_code, HELD)
+                messages.append("action:coalesced")
+                continue
             if not run_fix_sweep:
+                action_pr_states[action_key] = "pending"
                 continue
             if ledger.active_job() is not None:
+                action_pr_states[action_key] = "pending"
                 messages.append("action_busy")
                 exit_code = max(exit_code, HELD)
                 continue
@@ -1375,6 +1440,7 @@ def triage_notifications(
                 notified += delivered
                 exit_code = max(exit_code, action_exit)
                 messages.append(f"action:{action_outcome.outcome}")
+                action_pr_states[action_key] = "terminal"
             except (RunnerError, GitHubError, OSError, ValueError) as exc:
                 safe_error = redact_text(
                     str(exc) or exc.__class__.__name__, config.private_markers
@@ -1403,6 +1469,7 @@ def triage_notifications(
                     joel_summary=summary if terminal else "",
                 )
                 if terminal:
+                    action_pr_states[action_key] = "terminal"
                     if _paper_trail(config, summary):
                         notified += 1
                         terminal_decision = NotifyTriageDecisionV1(
@@ -1426,6 +1493,7 @@ def triage_notifications(
                     exit_code = max(exit_code, HELD)
                     messages.append("action:broken")
                 else:
+                    action_pr_states[action_key] = "pending"
                     exit_code = max(exit_code, HELD)
                     messages.append("action:retry_pending")
             continue

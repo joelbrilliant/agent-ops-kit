@@ -297,6 +297,71 @@ def test_triage_notifies_done_only_after_verified_worker_completion(tmp_path: Pa
     assert row is not None and row["status"] == "processed"
 
 
+def test_duplicate_notifications_for_same_pr_run_one_action_and_one_paper_trail(
+    tmp_path: Path,
+) -> None:
+    head, sha, ref = init_head_repo(tmp_path / "git")
+    remote = make_bare_remote(tmp_path / "git", head)
+    worker = _worker(tmp_path / "scripts" / "notify.py")
+    sink = tmp_path / "paper-trail.txt"
+    notifier = [
+        sys_executable(),
+        "-c",
+        "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2])",
+        str(sink),
+        "{message}",
+    ]
+    cfg = _configured(tmp_path / "cfg", worker, notifier=notifier)
+    fake = FakeGitHub()
+    payload = _wire_pr(fake, remote=remote, sha=sha, ref=ref)
+    _wire_ci(fake, payload)
+    duplicate = _ci_notification()
+    duplicate["id"] = "ci-action-2"
+    duplicate["updated_at"] = "2026-08-02T07:01:00Z"
+    fake.notifications.append(duplicate)
+
+    outcome = triage_notifications(cfg, client=fake)
+
+    assert outcome.exit_code == 0
+    assert outcome.acted_fix == 2
+    assert outcome.notified_joel == 1
+    assert len(fake.pr_comments) == 1
+    assert fake.marked_read == ["ci-action-1", "ci-action-2"]
+    ledger = Ledger(cfg.state_dir / "ledger.sqlite3")
+    assert len(ledger.list_recent_claims()) == 1
+    assert ledger.get_notification("ci-action-1")["status"] == "processed"
+    assert ledger.get_notification("ci-action-2")["status"] == "processed"
+
+
+def test_duplicate_notifications_share_one_retry_owner_per_run(tmp_path: Path) -> None:
+    head, sha, ref = init_head_repo(tmp_path / "git")
+    remote = make_bare_remote(tmp_path / "git", head)
+    worker = _worker(tmp_path / "scripts" / "notify.py", exit_code=1)
+    cfg = _configured(tmp_path / "cfg", worker, max_attempts=2)
+    fake = FakeGitHub()
+    payload = _wire_pr(fake, remote=remote, sha=sha, ref=ref)
+    _wire_ci(fake, payload)
+    duplicate = _ci_notification()
+    duplicate["id"] = "ci-action-2"
+    duplicate["updated_at"] = "2026-08-02T07:01:00Z"
+    fake.notifications.append(duplicate)
+
+    first = triage_notifications(cfg, client=fake)
+
+    assert first.exit_code != 0
+    ledger = Ledger(cfg.state_dir / "ledger.sqlite3")
+    assert len(ledger.list_recent_claims()) == 1
+    assert ledger.get_notification("ci-action-1")["action_attempts"] == 1
+    assert ledger.get_notification("ci-action-2")["action_attempts"] == 0
+
+    second = triage_notifications(cfg, client=fake)
+
+    assert second.exit_code != 0
+    assert len(ledger.list_recent_claims()) == 2
+    assert ledger.get_notification("ci-action-1")["action_attempts"] == 2
+    assert ledger.get_notification("ci-action-2")["action_attempts"] == 0
+
+
 def test_worker_failure_retries_silently_then_reports_broken_with_fix(tmp_path: Path) -> None:
     head, sha, ref = init_head_repo(tmp_path / "git")
     remote = make_bare_remote(tmp_path / "git", head)

@@ -23,6 +23,10 @@ Local JSON only. Never commit real config or state directories.
 - `default_verification_commands` - map of check id to argv array
 - `repository_policies` - per-repo `permitted_paths` and `verification_commands`; `*` is an optional fallback for unlisted repositories, while an exact repository entry wins and is not merged with the fallback
 - `notification_mode` - `quiet` | `concise` | `verbose`
+- `notification_triage` - GitHub notification front door. `action_worker_command`
+  is an argv array with all three fixed runner placeholders;
+  `max_action_attempts` is 1 to 5; `needs_joel_command` is the terminal Buzz
+  paper-trail helper and must contain a whole-token `{message}` placeholder
 - `reclaim_after_seconds` - interrupted job reclaim threshold (default 6h)
 - `runner_timeout_seconds` - external runner timeout
 - `pause_file_name` - relative name under `state_dir` (default `PAUSED`)
@@ -41,6 +45,15 @@ Untrusted review text is never interpolated into argv. It is written only into t
 ## Runner contract
 
 The classifier must start a fresh session and return `ClassifierResponseV1` with a continuation token and exact runner identity. The builder must continue that session, set `fresh_session` to false, attest the continuation-token digest, and bind its response to the exact base and resulting SHAs. The reviewer must start a second fresh session, distinct from the classifier session, and return `ReviewerResponseV1` bound to the candidate and resulting SHAs.
+
+The notification action worker returns `NotificationWorkerResponseV1` with one
+terminal outcome: `fixed`, `reply_only`, `no_action`, or `broken`. The
+orchestrator owns the durable claim, isolated worktree, verification, normal
+push, PR comment readback, notification mark-read and terminal paper trail.
+`fixed` receives the same fresh reviewer and final verification gate as the
+trusted inline-review lane. Runner or API failures retry silently up to the
+configured bound. Only a terminal broken outcome is sent to Joel, with both
+what happened and a proposed fix.
 
 Responses use exact schemas. Missing keys, extra keys, route mismatches, session mismatches, stale SHAs, unresolved findings, or failed voice attestation stop the job and open the global circuit before any push.
 

@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_notify = pr_sub.add_parser(
         "notify-triage",
-        help="Front-door GitHub notification triage (NO_ACTION / ACTION_FIX / NEEDS_JOEL)",
+        help="Front-door GitHub notification triage with terminal done/broken paper trail",
     )
     add_config(p_notify)
     p_notify.add_argument(

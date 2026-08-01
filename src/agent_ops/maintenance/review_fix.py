@@ -662,7 +662,13 @@ def run_claimed_job(
                 ledger.open_circuit("worktree_cleanup_failed")
 
 
-def sweep(config: Config, client: Optional[GitHubClient] = None) -> SweepOutcome:
+def sweep(
+    config: Config,
+    client: Optional[GitHubClient] = None,
+    *,
+    target_repository: str = "",
+    target_pr_number: int = 0,
+) -> SweepOutcome:
     ensure_state_dirs(config)
     github = client or GhClient(config.gh_command)
     ledger = Ledger(config.state_dir / "ledger.sqlite3")
@@ -696,7 +702,15 @@ def sweep(config: Config, client: Optional[GitHubClient] = None) -> SweepOutcome
             inspected_prs=inspected.inspected_prs,
             signals_found=len(inspected.signals),
         )
-    if not inspected.signals:
+    signals = list(inspected.signals)
+    if target_repository and target_pr_number:
+        signals = [
+            signal
+            for signal in signals
+            if signal.repository.lower() == target_repository.lower()
+            and signal.pr_number == int(target_pr_number)
+        ]
+    if not signals:
         return SweepOutcome(
             exit_code=0,
             message="no_actionable_signal",
@@ -722,10 +736,10 @@ def sweep(config: Config, client: Optional[GitHubClient] = None) -> SweepOutcome
             exit_code=1,
             message=reason,
             inspected_prs=inspected.inspected_prs,
-            signals_found=len(inspected.signals),
+            signals_found=len(signals),
         )
 
-    queue = list(inspected.signals)
+    queue = list(signals)
     attempted: set = set()
     receipts: List[Path] = []
     completed = 0
@@ -757,7 +771,7 @@ def sweep(config: Config, client: Optional[GitHubClient] = None) -> SweepOutcome
                 jobs_completed=completed,
                 jobs_held=held,
                 inspected_prs=inspected.inspected_prs,
-                signals_found=len(inspected.signals),
+                signals_found=len(signals),
             )
         if claim_result == "circuit_open":
             last_message = f"circuit_open:{detail or 'unknown'}"
@@ -790,7 +804,15 @@ def sweep(config: Config, client: Optional[GitHubClient] = None) -> SweepOutcome
             ]
             try:
                 refreshed = inspect_work(config, client=github)
-                for candidate in refreshed.signals:
+                refreshed_signals = list(refreshed.signals)
+                if target_repository and target_pr_number:
+                    refreshed_signals = [
+                        candidate
+                        for candidate in refreshed_signals
+                        if candidate.repository.lower() == target_repository.lower()
+                        and candidate.pr_number == int(target_pr_number)
+                    ]
+                for candidate in refreshed_signals:
                     if _claim_key(candidate) not in attempted:
                         queue.append(candidate)
             except (GitHubError, RunnerError, OSError, ValueError) as exc:
@@ -816,5 +838,5 @@ def sweep(config: Config, client: Optional[GitHubClient] = None) -> SweepOutcome
         jobs_completed=completed,
         jobs_held=held,
         inspected_prs=inspected.inspected_prs,
-        signals_found=len(inspected.signals),
+        signals_found=len(signals),
     )

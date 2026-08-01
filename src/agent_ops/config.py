@@ -48,6 +48,8 @@ class NotificationTriagePolicy:
     mark_read_on_needs_joel: bool = False
     max_per_run: int = 40
     run_fix_sweep_on_action: bool = True
+    action_worker_command: List[str] = field(default_factory=list)
+    max_action_attempts: int = 2
     needs_joel_command: List[str] = field(default_factory=list)
 
 
@@ -202,6 +204,8 @@ def _parse_notification_triage(raw: Any) -> NotificationTriagePolicy:
         "mark_read_on_needs_joel",
         "max_per_run",
         "run_fix_sweep_on_action",
+        "action_worker_command",
+        "max_action_attempts",
         "needs_joel_command",
     }
     unknown = sorted(set(raw) - allowed)
@@ -219,6 +223,36 @@ def _parse_notification_triage(raw: Any) -> NotificationTriagePolicy:
     max_per_run = int(raw.get("max_per_run", 40))
     if max_per_run < 1 or max_per_run > 200:
         raise ConfigError("notification_triage.max_per_run must be 1..200")
+
+    max_action_attempts = int(raw.get("max_action_attempts", 2))
+    if max_action_attempts < 1 or max_action_attempts > 5:
+        raise ConfigError("notification_triage.max_action_attempts must be 1..5")
+
+    action_worker_command: List[str] = []
+    if "action_worker_command" in raw and raw.get("action_worker_command") is not None:
+        value = raw["action_worker_command"]
+        if not isinstance(value, list) or not value or not all(
+            isinstance(item, str) for item in value
+        ):
+            raise ConfigError(
+                "notification_triage.action_worker_command must be a non-empty argv array"
+            )
+        action_worker_command = list(value)
+        joined = "\n".join(action_worker_command)
+        missing = [
+            placeholder
+            for placeholder in ("{request_path}", "{response_path}", "{worktree_path}")
+            if placeholder not in joined
+        ]
+        if missing:
+            raise ConfigError(
+                "notification_triage.action_worker_command is missing placeholders: "
+                + ",".join(missing)
+            )
+        if any("\x00" in item or "\n" in item or "\r" in item for item in action_worker_command):
+            raise ConfigError(
+                "notification_triage.action_worker_command contains a control character"
+            )
 
     command: List[str] = []
     if "needs_joel_command" in raw and raw.get("needs_joel_command") is not None:
@@ -240,6 +274,8 @@ def _parse_notification_triage(raw: Any) -> NotificationTriagePolicy:
         mark_read_on_needs_joel=_bool("mark_read_on_needs_joel", False),
         max_per_run=max_per_run,
         run_fix_sweep_on_action=_bool("run_fix_sweep_on_action", True),
+        action_worker_command=action_worker_command,
+        max_action_attempts=max_action_attempts,
         needs_joel_command=command,
     )
 

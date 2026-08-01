@@ -43,6 +43,12 @@ class GitHubClient(Protocol):
     def mark_notification_read(self, thread_id: str) -> None:
         ...
 
+    def create_pr_comment(self, repository: str, pr_number: int, body: str) -> int:
+        ...
+
+    def get_issue_comment(self, repository: str, comment_id: int) -> Dict[str, Any]:
+        ...
+
 
 @dataclass
 class GhClient:
@@ -197,6 +203,31 @@ class GhClient:
             raise GitHubError(f"get notification thread failed: {thread_id}")
         return dict(payload)
 
+    def create_pr_comment(self, repository: str, pr_number: int, body: str) -> int:
+        if not body.strip():
+            raise GitHubError("PR comment body is empty")
+        result = self._run(
+            [
+                "api",
+                "-X",
+                "POST",
+                f"repos/{repository}/issues/{int(pr_number)}/comments",
+                "-f",
+                f"body={body}",
+            ]
+        )
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise GitHubError("create PR comment returned invalid JSON") from exc
+        comment_id = int(payload.get("id") or 0) if isinstance(payload, dict) else 0
+        if comment_id <= 0:
+            raise GitHubError("create PR comment returned no id")
+        return comment_id
+
+    def get_issue_comment(self, repository: str, comment_id: int) -> Dict[str, Any]:
+        return self.rest_get(f"repos/{repository}/issues/comments/{int(comment_id)}")
+
 
 class FakeGitHub:
     """In-memory GitHub for synthetic tests.
@@ -215,6 +246,7 @@ class FakeGitHub:
         self.all_check_rows: Dict[str, Any] = {}
         self.notifications: List[Dict[str, Any]] = []
         self.marked_read: List[str] = []
+        self.pr_comments: List[Dict[str, Any]] = []
 
     def rest_search_issues(self, query: str, page: int = 1, per_page: int = 100) -> Dict[str, Any]:
         pages: List[List[Dict[str, Any]]] = self.search_pages.get(query, [])
@@ -309,3 +341,23 @@ class FakeGitHub:
                 return dict(row)
         raise GitHubError(f"notification thread not found: {thread_id}")
 
+    def create_pr_comment(self, repository: str, pr_number: int, body: str) -> int:
+        comment_id = len(self.pr_comments) + 1
+        self.pr_comments.append(
+            {
+                "id": comment_id,
+                "repository": repository,
+                "pr_number": int(pr_number),
+                "body": body,
+            }
+        )
+        return comment_id
+
+    def get_issue_comment(self, repository: str, comment_id: int) -> Dict[str, Any]:
+        for comment in self.pr_comments:
+            if (
+                comment["repository"].lower() == repository.lower()
+                and int(comment["id"]) == int(comment_id)
+            ):
+                return dict(comment)
+        raise GitHubError(f"issue comment not found: {repository}#{comment_id}")

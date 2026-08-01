@@ -19,6 +19,8 @@ pip install -e ".[dev]"
 ```bash
 agent-ops pr inspect --config /path/to/config.json
 agent-ops pr sweep --config /path/to/config.json
+agent-ops pr notify-inspect --config /path/to/config.json
+agent-ops pr notify-triage --config /path/to/config.json
 agent-ops pr status --config /path/to/config.json
 agent-ops pr pause --config /path/to/config.json
 agent-ops pr resume --config /path/to/config.json
@@ -44,6 +46,8 @@ A three-hour Hermes cron example is in `docs/cron-hermes.md`.
 - Classifier and builder share one session. Reviewer-fixer uses a second fresh session.
 - Strict runner schemas attest exact route, session identity, candidate SHA, resulting SHA, and reply voice gate.
 - One active job at a time with atomic deduplication, interruption recovery, and a global circuit breaker.
+- Actionable PR notifications are not marked read until Oscar reaches a verified terminal state. CI and top-level PR work run synchronously in an isolated worktree, retry silently within a fixed bound, and use a fresh reviewer before any push.
+- Joel receives no routine triage requests. Buzz is used only after verified completion, or after a terminal broken outcome with a proposed fix. Failed delivery remains durable and retries without repeating GitHub work.
 - Paused and circuit-open sweeps inspect only.
 - Thread, head SHA, head repository permission, required checks, remote ref, clean worktree, and history are revalidated immediately before mutation.
 - Pushes target the attested head repository and existing head ref without force.

@@ -133,6 +133,16 @@ def test_load_config_roundtrip(tmp_path: Path):
                     "private_markers": [],
                 },
                 "notification_mode": "quiet",
+                "notification_triage": {
+                    "enabled": True,
+                    "action_worker_command": [
+                        "worker",
+                        "{request_path}",
+                        "{response_path}",
+                        "{worktree_path}",
+                    ],
+                    "max_action_attempts": 3,
+                },
                 "default_verification_commands": {"unit": ["true"]},
                 "repository_policies": {
                     "Example-User/Repo": {
@@ -159,6 +169,8 @@ def test_load_config_roundtrip(tmp_path: Path):
     assert exact_policy.permitted_paths == ["src/*"]
     assert fallback_policy.name == "*"
     assert cfg.trusted_reviewer_associations == ["OWNER", "MEMBER", "COLLABORATOR"]
+    assert cfg.notification_triage.max_action_attempts == 3
+    assert cfg.notification_triage.action_worker_command[0] == "worker"
 
     optional = json.loads(cfg_path.read_text(encoding="utf-8"))
     optional.pop("excluded_repositories")

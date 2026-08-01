@@ -218,7 +218,7 @@ class NotifyTriageDecisionV1:
 
     NO_ACTION: dismiss silently (Joel paste workflow: "no action required").
     ACTION_FIX: hand to the existing PR fix loop when an actionable signal exists.
-    NEEDS_JOEL: ping Joel in the configured exception channel only.
+    NEEDS_JOEL: compatibility value for a terminal catastrophic exception only.
     """
 
     decision: str

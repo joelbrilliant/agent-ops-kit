@@ -18,6 +18,14 @@ Public surface for Agent Ops Kit PR maintenance.
 
 Each job has exactly two fresh Oscar sessions. Classification and build are one session. Review-fix is the second. The external runners return strict response schemas with exact route, freshness, session, and SHA attestations. The orchestrator rejects missing or extra fields.
 
+Actionable PR notifications share the same one-active-job ledger. Trusted
+inline review threads use the existing classifier/build/reviewer sweep. CI and
+top-level PR notifications use one bounded `NotificationWorkerResponseV1`; a
+code change then passes through the same independent reviewer and final
+verification gate. GitHub credentials, pushes, comments, readback, mark-read and
+Buzz delivery remain in the deterministic orchestrator. No detached chat
+process or mutable job JSON controls lifecycle state.
+
 Oscar gets no orchestrator GitHub credential capability. Runner processes receive an allowlisted environment, isolated `HOME` and `GH_CONFIG_DIR`, disabled Git credential helpers, and no inherited GitHub token variables. The orchestrator separately proves its own GitHub identity and that `gh auth status` fails in the runner environment before launching Oscar.
 
 ## Sweep semantics

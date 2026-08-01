@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS notifications (
   related_url TEXT,
   joel_summary TEXT,
   status TEXT NOT NULL,
+  action_attempts INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT,
   created_at REAL NOT NULL,
   recorded_at REAL NOT NULL
 );
@@ -143,6 +145,21 @@ class Ledger:
                     if "phase" not in columns:
                         conn.execute(
                             "ALTER TABLE jobs ADD COLUMN phase TEXT NOT NULL DEFAULT 'claimed'"
+                        )
+                    notification_columns = {
+                        str(row["name"])
+                        for row in conn.execute(
+                            "PRAGMA table_info(notifications)"
+                        ).fetchall()
+                    }
+                    if "action_attempts" not in notification_columns:
+                        conn.execute(
+                            "ALTER TABLE notifications ADD COLUMN action_attempts "
+                            "INTEGER NOT NULL DEFAULT 0"
+                        )
+                    if "last_error" not in notification_columns:
+                        conn.execute(
+                            "ALTER TABLE notifications ADD COLUMN last_error TEXT"
                         )
                 return
             except sqlite3.OperationalError as exc:
@@ -505,6 +522,8 @@ class Ledger:
                 "related_url": row["related_url"] or "",
                 "joel_summary": row["joel_summary"] or "",
                 "status": row["status"],
+                "action_attempts": int(row["action_attempts"] or 0),
+                "last_error": row["last_error"] or "",
                 "schema": "NotifyTriageDecisionV1",
                 "mark_read": False,
             }
@@ -539,6 +558,12 @@ class Ledger:
                   related_url=excluded.related_url,
                   joel_summary=excluded.joel_summary,
                   status=excluded.status,
+                  action_attempts=CASE
+                    WHEN notifications.updated_at = excluded.updated_at
+                    THEN notifications.action_attempts ELSE 0 END,
+                  last_error=CASE
+                    WHEN notifications.updated_at = excluded.updated_at
+                    THEN notifications.last_error ELSE NULL END,
                   recorded_at=excluded.recorded_at
                 """,
                 (
@@ -556,33 +581,37 @@ class Ledger:
                 ),
             )
 
-    def has_needs_joel_for_pr(
-        self,
-        repository: str,
-        pr_number: int,
-        *,
-        exclude_thread_id: str = "",
-    ) -> bool:
-        """True if a durable NEEDS_JOEL was already recorded for this PR.
-
-        Used to coalesce pings across runs (Frank BLOCK #6).
-        """
-        repo = (repository or "").lower()
-        pr = int(pr_number or 0)
-        if not repo or not pr:
-            return False
-        with self._connect() as conn:
+    def begin_notification_attempt(self, thread_id: str) -> int:
+        """Atomically increment and return the durable Oscar attempt number."""
+        now = time.time()
+        with self._tx() as conn:
             row = conn.execute(
-                """
-                SELECT thread_id FROM notifications
-                WHERE lower(COALESCE(repository, '')) = ?
-                  AND pr_number = ?
-                  AND decision = 'NEEDS_JOEL'
-                  AND status IN ('processed', 'pending_notify')
-                  AND (? = '' OR thread_id != ?)
-                LIMIT 1
-                """,
-                (repo, pr, exclude_thread_id or "", exclude_thread_id or ""),
+                "SELECT action_attempts FROM notifications WHERE thread_id = ?",
+                (thread_id,),
             ).fetchone()
-            return row is not None
+            if not row:
+                raise ValueError("notification must be recorded before action attempt")
+            attempts = int(row["action_attempts"] or 0) + 1
+            conn.execute(
+                "UPDATE notifications SET action_attempts = ?, status = 'running_action', "
+                "recorded_at = ?, last_error = NULL WHERE thread_id = ?",
+                (attempts, now, thread_id),
+            )
+            return attempts
 
+    def record_notification_action_failure(
+        self,
+        thread_id: str,
+        *,
+        error: str,
+        terminal: bool,
+        joel_summary: str = "",
+    ) -> None:
+        now = time.time()
+        status = "pending_broken_notify" if terminal else "pending_action"
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE notifications SET status = ?, last_error = ?, joel_summary = ?, "
+                "recorded_at = ? WHERE thread_id = ?",
+                (status, error, joel_summary or None, now, thread_id),
+            )

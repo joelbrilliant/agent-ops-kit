@@ -53,6 +53,31 @@
     "private_markers": ["YOUR_PRIVATE_WORKSPACE_MARKER"]
   },
   "notification_mode": "concise",
+  "notification_triage": {
+    "enabled": true,
+    "participating_only": false,
+    "include_read": false,
+    "mark_read_on_no_action": true,
+    "mark_read_on_action": true,
+    "mark_read_on_needs_joel": false,
+    "max_per_run": 40,
+    "run_fix_sweep_on_action": true,
+    "max_action_attempts": 2,
+    "action_worker_command": [
+      "python3",
+      "/absolute/path/to/your-notification-worker.py",
+      "--request",
+      "{request_path}",
+      "--response",
+      "{response_path}",
+      "--worktree",
+      "{worktree_path}"
+    ],
+    "needs_joel_command": [
+      "/absolute/path/to/your-paper-trail-helper",
+      "{message}"
+    ]
+  },
   "default_verification_commands": {
     "unit": ["python3", "-m", "pytest", "-q"]
   },

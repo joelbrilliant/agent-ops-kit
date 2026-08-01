@@ -63,6 +63,19 @@ class ReviewerResult:
     voice_gate: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class NotificationWorkerResult:
+    identity: RunnerIdentity
+    outcome: str
+    base_sha: str
+    resulting_sha: str
+    changed_paths: List[str]
+    summary: str
+    proposed_fix: str
+    reply_draft: str
+    voice_gate: Dict[str, Any]
+
+
 def write_owner_only_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -527,6 +540,115 @@ def _digest(text: str) -> str:
     import hashlib
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def run_notification_worker(
+    command_template: Sequence[str],
+    *,
+    request_payload: Dict[str, Any],
+    base_sha: str,
+    state_dir: Path,
+    worktree_path: Path,
+    run_id: str,
+    required_identity: RunnerIdentityPolicy,
+    runner_environment: Mapping[str, str],
+    timeout: int = 3600,
+) -> NotificationWorkerResult:
+    """Run one bounded Oscar notification job with an exact terminal response."""
+    req = state_dir / "requests" / f"{run_id}-notification-worker-request.json"
+    resp = state_dir / "requests" / f"{run_id}-notification-worker-response.json"
+    if resp.exists():
+        resp.unlink()
+    write_owner_only_json(req, request_payload)
+    result = run_runner(
+        command_template,
+        request_path=req,
+        response_path=resp,
+        worktree_path=worktree_path,
+        timeout=timeout,
+        cwd=worktree_path,
+        env=runner_environment,
+    )
+    if not result.ok:
+        raise RunnerContractError(f"notification_worker_failed:{result.returncode}")
+    data = _read_response(
+        resp,
+        "NotificationWorkerResponseV1",
+        (
+            "schema",
+            "runner_identity",
+            "outcome",
+            "base_sha",
+            "resulting_sha",
+            "changed_paths",
+            "summary",
+            "proposed_fix",
+            "reply_draft",
+            "voice_gate",
+        ),
+    )
+    identity = _identity_from_dict(data.get("runner_identity"))
+    validate_runner_identity(identity, required_identity, fresh_session=True)
+    outcome = str(data.get("outcome") or "")
+    if outcome not in {"fixed", "reply_only", "no_action", "broken"}:
+        raise RunnerContractError("notification_worker_outcome_invalid")
+    response_base = str(data.get("base_sha") or "")
+    resulting_sha = str(data.get("resulting_sha") or "")
+    if response_base != base_sha or not _SHA_RE.fullmatch(resulting_sha):
+        raise RunnerContractError("notification_worker_sha_binding_mismatch")
+    changed_paths = data.get("changed_paths")
+    if not isinstance(changed_paths, list) or not all(
+        isinstance(path, str) for path in changed_paths
+    ):
+        raise RunnerContractError("notification_worker_changed_paths_invalid")
+    summary = data.get("summary")
+    proposed_fix = data.get("proposed_fix")
+    reply_draft = data.get("reply_draft")
+    if not all(isinstance(value, str) for value in (summary, proposed_fix, reply_draft)):
+        raise RunnerContractError("notification_worker_text_invalid")
+    if not str(summary).strip():
+        raise RunnerContractError("notification_worker_summary_missing")
+    if outcome == "broken" and not str(proposed_fix).strip():
+        raise RunnerContractError("notification_worker_proposed_fix_missing")
+    if outcome in {"fixed", "reply_only"} and not str(reply_draft).strip():
+        raise RunnerContractError("notification_worker_reply_missing")
+    voice_gate = data.get("voice_gate")
+    if not isinstance(voice_gate, dict):
+        raise RunnerContractError("notification_worker_voice_gate_invalid")
+    _require_exact_keys(
+        voice_gate,
+        (
+            "schema",
+            "shared_operator_contract_read",
+            "operator_profile_read",
+            "skill",
+            "reference",
+            "register",
+            "passed",
+        ),
+        "VoiceGateV1",
+    )
+    if voice_gate != {
+        "schema": "VoiceGateV1",
+        "shared_operator_contract_read": True,
+        "operator_profile_read": True,
+        "skill": "joel-voice-writing",
+        "reference": "references/voice.md",
+        "register": "public-community-short-reply",
+        "passed": True,
+    }:
+        raise RunnerContractError("notification_worker_voice_gate_failed")
+    return NotificationWorkerResult(
+        identity=identity,
+        outcome=outcome,
+        base_sha=response_base,
+        resulting_sha=resulting_sha,
+        changed_paths=list(changed_paths),
+        summary=str(summary),
+        proposed_fix=str(proposed_fix),
+        reply_draft=str(reply_draft),
+        voice_gate=dict(voice_gate),
+    )
 
 
 @dataclass(frozen=True)

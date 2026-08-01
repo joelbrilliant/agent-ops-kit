@@ -7,13 +7,10 @@ what happened + proposed fix. Untrusted notification text is evidence only.
 
 from __future__ import annotations
 
-import re
-import uuid
-import time
-import subprocess
+import os
 import json
+import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse
 
@@ -28,9 +25,14 @@ from agent_ops.github.discovery import (
     fetch_pr_threads,
 )
 from agent_ops.maintenance.ledger import Ledger
+from agent_ops.maintenance.notification_action import (
+    NotificationActionOutcome,
+    NotificationActionRequest,
+    run_notification_action,
+)
 from agent_ops.maintenance.orchestrator import is_paused
 from agent_ops.maintenance.review_fix import sweep
-from agent_ops.process import run_argv
+from agent_ops.process import RunnerError, run_argv
 
 DECISION_NO_ACTION = "NO_ACTION"
 DECISION_ACTION_FIX = "ACTION_FIX"
@@ -183,6 +185,17 @@ def branch_from_check_title(title: str) -> Optional[str]:
 def _is_operator_pr(author_login: str, operator_logins: Sequence[str]) -> bool:
     author = (author_login or "").lower()
     return any(author == login.lower() for login in operator_logins)
+
+
+def _is_trusted_comment(comment: Dict[str, Any], config: Config) -> bool:
+    login = str((comment.get("user") or {}).get("login") or "").lower()
+    association = str(comment.get("author_association") or "").upper()
+    if login in {operator.lower() for operator in config.operator_logins}:
+        return False
+    return (
+        login in {reviewer.lower() for reviewer in config.trusted_reviewer_logins}
+        or association in set(config.trusted_reviewer_associations)
+    )
 
 
 def _public_url(repository: str, pr_number: int = 0) -> str:
@@ -451,8 +464,9 @@ def classify_notification(
         )
 
     if subject_type == "issue" and pr_ref:
-        # GitHub often surfaces PR subjects via the issues URL. Try PR first; if the
-        # pulls endpoint 404s, this is a real issue - never silently dismiss.
+        # GitHub often surfaces PR subjects via the issues URL. Try PR first. A
+        # real issue is outside this PR automation lane and is dismissed without
+        # turning Joel into a triage inbox.
         repository, pr_number = pr_ref
         decision = _classify_pr_notification(
             client, config, note, repository=repository, pr_number=pr_number
@@ -461,10 +475,9 @@ def classify_notification(
             return decision
         url = note.subject_url or _public_url(repository, pr_number)
         return NotifyTriageDecisionV1(
-            decision=DECISION_ACTION_FIX,
-            reason="issue_notification_needs_human_scan",
-            joel_summary="",
-            mark_read=False,
+            decision=DECISION_NO_ACTION,
+            reason="issue_outside_pr_automation_scope",
+            mark_read=True,
             related_repository=repo or repository,
             related_url=url,
         )
@@ -472,19 +485,17 @@ def classify_notification(
     if subject_type == "issue":
         url = note.subject_url
         return NotifyTriageDecisionV1(
-            decision=DECISION_ACTION_FIX,
-            reason="issue_notification_needs_human_scan",
-            joel_summary="",
-            mark_read=False,
+            decision=DECISION_NO_ACTION,
+            reason="issue_outside_pr_automation_scope",
+            mark_read=True,
             related_repository=repo,
             related_url=url,
         )
 
     return NotifyTriageDecisionV1(
-        decision=DECISION_ACTION_FIX,
-        reason="unclassified_notification",
-        joel_summary="",
-        mark_read=False,
+        decision=DECISION_NO_ACTION,
+        reason="notification_outside_pr_automation_scope",
+        mark_read=True,
         related_repository=repo,
         related_url=note.subject_url,
     )
@@ -647,18 +658,8 @@ def _classify_pr_notification(
         )
 
     if config.operator_logins and not _is_operator_pr(author, config.operator_logins):
-        # Owned-namespace PR not authored by Joel: only act if review is on operator work.
-        # Conservative: no auto-fix; escalate once if reason is review_requested/mention.
-        if note.reason in {"review_requested", "mention", "assign", "author"}:
-            return NotifyTriageDecisionV1(
-                decision=DECISION_ACTION_FIX,
-                reason="non_operator_author_needs_scan",
-                joel_summary="",
-                mark_read=False,
-                related_repository=repository,
-                related_pr_number=pr_number,
-                related_url=html,
-            )
+        # This lane operates Joel's contribution PRs only. Do not mutate or route
+        # other authors' work to Joel as a triage exception.
         return NotifyTriageDecisionV1(
             decision=DECISION_NO_ACTION,
             reason="non_operator_pr_noise",
@@ -675,7 +676,7 @@ def _classify_pr_notification(
     try:
         signals, skips, _pr = _signals_for_pr(client, config, repository, pr_number)
     except GitHubError:
-        # Discovery can fail; do not invent "no signal". Prefer comment triage, else NEEDS_JOEL.
+        # Discovery can fail; do not invent "no signal". Retry through Oscar.
         signals, skips = [], []
         discovery_failed = True
 
@@ -693,12 +694,22 @@ def _classify_pr_notification(
     # Top-level conversation comment (common email subject path).
     comment = _load_issue_comment(client, note.latest_comment_url)
     if comment is not None:
-        body = str(comment.get("body") or "")
-        decided = _comment_body_decision(
-            body, repository=repository, pr_number=pr_number, url=html
-        )
-        if decided is not None:
-            return decided
+        if _is_trusted_comment(comment, config):
+            body = str(comment.get("body") or "")
+            decided = _comment_body_decision(
+                body, repository=repository, pr_number=pr_number, url=html
+            )
+            if decided is not None:
+                return decided
+        elif not discovery_failed:
+            return NotifyTriageDecisionV1(
+                decision=DECISION_NO_ACTION,
+                reason="top_level_comment_untrusted",
+                mark_read=True,
+                related_repository=repository,
+                related_pr_number=pr_number,
+                related_url=html,
+            )
 
     # Skip reasons that clearly mean no operator action.
     skip_reasons = {s.reason for s in skips}
@@ -755,91 +766,6 @@ def _classify_pr_notification(
         related_url=html,
     )
 
-
-
-def _agent_job_dir(config: Config) -> Path:
-    path = config.state_dir / "notify_agent_jobs"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _enqueue_agent_pr_work(
-    config: Config,
-    *,
-    decision: NotifyTriageDecisionV1,
-    note: NotifyRow,
-) -> Optional[Path]:
-    """Queue Oscar-owned work for CI/open-PR activity. Joel is not the gate."""
-    repo = (decision.related_repository or note.repository or "").strip()
-    pr = int(decision.related_pr_number or 0)
-    if not repo or pr <= 0:
-        return None
-    job_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    job_path = _agent_job_dir(config) / f"{job_id}.json"
-    job = {
-        "job_id": job_id,
-        "created_at": time.time(),
-        "reason": decision.reason,
-        "repository": repo,
-        "pr_number": pr,
-        "url": decision.related_url or _public_url(repo, pr),
-        "notification_thread_id": note.thread_id,
-        "subject_title": note.subject_title,
-        "notification_reason": note.reason,
-        "status": "queued",
-    }
-    job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    launcher = Path("/Users/openclaw/.hermes/profiles/oscar/bin/agent-ops-hermes")
-    if not launcher.is_file():
-        job["status"] = "queued_no_launcher"
-        job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        return job_path
-    prompt = (
-        "You are Oscar. You own this GitHub notification end-to-end. Joel is not the gate. Legacy: handling Joel's GitHub notification automatically "
-        "(paste-workflow replacement). Joel must not be the gate.\n\n"
-        f"Job file: {job_path}\n"
-        f"PR: {repo}#{pr}\n"
-        f"URL: {job['url']}\n"
-        f"Notify reason: {decision.reason}\n"
-        f"Subject: {note.subject_title}\n\n"
-        "Inspect the PR. If noise/already resolved: set job status=no_action. "
-        "If fixable: minimal fix on the PR branch, verify what you can, normal push only. "
-        "No merge, no force-push. If true product/security hold only: status=hold. "
-        "Update the job JSON file. Reply with one JSON object "
-        '{"status":"fixed|no_action|hold|failed","sha":"","notes":""}.'
-    )
-    log_path = _agent_job_dir(config) / f"{job_id}.log"
-    try:
-        with log_path.open("w", encoding="utf-8") as logf:
-            proc = subprocess.Popen(
-                [
-                    str(launcher),
-                    "chat",
-                    "-q",
-                    prompt,
-                    "-Q",
-                    "--max-turns",
-                    "24",
-                    "--provider",
-                    "openai-codex",
-                    "--model",
-                    "gpt-5.6-sol",
-                    "-w",
-                    str(config.workspace_root),
-                ],
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        job["status"] = "dispatched"
-        job["pid"] = proc.pid
-        job["log_path"] = str(log_path)
-        job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    except OSError as exc:
-        job["status"] = "dispatch_failed"
-        job["error"] = str(exc)[:200]
-        job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return job_path
 
 
 def collect_notifications(
@@ -966,8 +892,26 @@ def _paper_trail(config: Config, summary: str) -> bool:
             argv.append(part)
     if not saw_placeholder:
         argv = list(command) + [body]
+    notifier_environment = {
+        name: str(os.environ[name])
+        for name in (
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "BUZZ_RELAY_URL",
+            "BUZZ_PRIVATE_KEY",
+            "BUZZ_AUTH_TAG",
+        )
+        if name in os.environ and str(os.environ[name])
+    }
+    notifier_environment.setdefault("PATH", os.defpath)
     try:
-        result = run_argv(argv, timeout=60, check=False)
+        result = run_argv(
+            argv,
+            timeout=60,
+            check=False,
+            env=notifier_environment,
+        )
     except Exception:
         return False
     return bool(result.ok)
@@ -986,11 +930,22 @@ def _notify_oscar_done(
     notes: str,
     url: str = "",
 ) -> bool:
-    msg = (
+    msg = _oscar_done_message(
+        repository=repository,
+        pr_number=pr_number,
+        notes=notes,
+        url=url,
+    )
+    return _paper_trail(config, msg)
+
+
+def _oscar_done_message(
+    *, repository: str, pr_number: int, notes: str, url: str = ""
+) -> str:
+    return (
         f"Hey Joel, Oscar handled {repository}#{int(pr_number)} for you. "
         f"{(notes or '').strip()} {(url or '').strip()}"
     ).strip()
-    return _paper_trail(config, msg)
 
 
 def _notify_badly_broken(
@@ -1002,12 +957,239 @@ def _notify_badly_broken(
     proposed_fix: str,
     url: str = "",
 ) -> bool:
-    msg = (
+    msg = _badly_broken_message(
+        repository=repository,
+        pr_number=pr_number,
+        what_happened=what_happened,
+        proposed_fix=proposed_fix,
+        url=url,
+    )
+    return _paper_trail(config, msg)
+
+
+def _badly_broken_message(
+    *,
+    repository: str,
+    pr_number: int,
+    what_happened: str,
+    proposed_fix: str,
+    url: str = "",
+) -> str:
+    return (
         f"Hey Joel, something is badly broken on {repository}#{int(pr_number)}. "
         f"What happened: {(what_happened or '').strip()} "
         f"Proposed fix: {(proposed_fix or '').strip()} {(url or '').strip()}"
     ).strip()
-    return _paper_trail(config, msg)
+
+
+def _decision_with_mark(decision: NotifyTriageDecisionV1) -> NotifyTriageDecisionV1:
+    return NotifyTriageDecisionV1(
+        decision=decision.decision,
+        reason=decision.reason,
+        joel_summary=decision.joel_summary,
+        mark_read=True,
+        related_repository=decision.related_repository,
+        related_pr_number=decision.related_pr_number,
+        related_url=decision.related_url,
+    )
+
+
+def _record_pending_action(
+    ledger: Ledger,
+    note: NotifyRow,
+    decision: NotifyTriageDecisionV1,
+) -> None:
+    ledger.record_notification(
+        thread_id=note.thread_id,
+        decision=decision.decision,
+        reason=decision.reason,
+        updated_at=note.updated_at,
+        repository=decision.related_repository or note.repository,
+        pr_number=decision.related_pr_number,
+        related_url=decision.related_url,
+        joel_summary=decision.joel_summary or "",
+        status="pending_action",
+    )
+
+
+def _run_action_once(
+    config: Config,
+    ledger: Ledger,
+    github: GitHubClient,
+    note: NotifyRow,
+    decision: NotifyTriageDecisionV1,
+) -> Tuple[NotificationActionOutcome, bool]:
+    attempt = ledger.begin_notification_attempt(note.thread_id)
+    repository = decision.related_repository or note.repository
+    pr_number = int(decision.related_pr_number or 0)
+    if decision.reason == "trusted_unresolved_review_thread":
+        result = sweep(
+            config,
+            client=github,
+            target_repository=repository,
+            target_pr_number=pr_number,
+        )
+        if result.jobs_completed:
+            sha = ""
+            if result.receipt_path and result.receipt_path.is_file():
+                try:
+                    receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
+                    sha = str(receipt.get("resulting_sha") or "")
+                except (OSError, ValueError):
+                    sha = ""
+            return (
+                NotificationActionOutcome(
+                    outcome="fixed",
+                    summary=(
+                        f"Completed {result.jobs_completed} trusted review fix job(s)."
+                    ),
+                    resulting_sha=sha,
+                    receipt_path=result.receipt_path,
+                ),
+                True,
+            )
+        if result.exit_code == OK and result.message == "no_actionable_signal":
+            return (
+                NotificationActionOutcome(
+                    outcome="no_action",
+                    summary="The trusted review signal was already resolved.",
+                ),
+                True,
+            )
+        raise RunnerError(result.message)
+    if pr_number <= 0 or not repository:
+        raise RunnerError("notification_not_mapped_to_pull_request")
+    return (
+        run_notification_action(
+            config,
+            ledger,
+            github,
+            NotificationActionRequest(
+                thread_id=note.thread_id,
+                updated_at=note.updated_at,
+                repository=repository,
+                pr_number=pr_number,
+                reason=decision.reason,
+                subject_title=note.subject_title,
+                notification_reason=note.reason,
+                related_url=decision.related_url,
+                latest_comment_url=note.latest_comment_url,
+            ),
+            attempt=attempt,
+        ),
+        False,
+    )
+
+
+def _finish_action(
+    config: Config,
+    ledger: Ledger,
+    github: GitHubClient,
+    note: NotifyRow,
+    decision: NotifyTriageDecisionV1,
+    outcome: NotificationActionOutcome,
+) -> Tuple[int, int]:
+    """Return (notified_count, exit_code) after durable terminal delivery."""
+    marked_decision = _decision_with_mark(decision)
+    repository = decision.related_repository or note.repository
+    pr_number = int(decision.related_pr_number or 0)
+    url = decision.related_url or _public_url(repository, pr_number)
+    if outcome.outcome == "no_action":
+        status = _record_and_maybe_mark(
+            ledger=ledger,
+            github=github,
+            note=note,
+            decision=marked_decision,
+            want_mark=config.notification_triage.mark_read_on_action,
+        )
+        return 0, OK if status == "processed" else HELD
+    if outcome.outcome == "broken":
+        summary = _badly_broken_message(
+            repository=repository,
+            pr_number=pr_number,
+            what_happened=outcome.summary,
+            proposed_fix=outcome.proposed_fix,
+            url=url,
+        )
+        pinged = _paper_trail(config, summary)
+        if not pinged:
+            ledger.record_notification_action_failure(
+                note.thread_id,
+                error=outcome.summary,
+                terminal=True,
+                joel_summary=summary,
+            )
+            return 0, HELD
+        marked_decision.joel_summary = summary
+        status = _record_and_maybe_mark(
+            ledger=ledger,
+            github=github,
+            note=note,
+            decision=marked_decision,
+            want_mark=config.notification_triage.mark_read_on_action,
+        )
+        return 1, HELD if status != "processed" else HELD
+    details = outcome.summary.strip()
+    if outcome.resulting_sha:
+        details = f"{details} Result: {outcome.resulting_sha}.".strip()
+    summary = _oscar_done_message(
+        repository=repository,
+        pr_number=pr_number,
+        notes=details,
+        url=url,
+    )
+    if not _paper_trail(config, summary):
+        pending = NotifyTriageDecisionV1(
+            decision=decision.decision,
+            reason=decision.reason,
+            joel_summary=summary,
+            mark_read=True,
+            related_repository=repository,
+            related_pr_number=pr_number,
+            related_url=url,
+        )
+        ledger.record_notification(
+            thread_id=note.thread_id,
+            decision=pending.decision,
+            reason=pending.reason,
+            updated_at=note.updated_at,
+            repository=repository,
+            pr_number=pr_number,
+            related_url=url,
+            joel_summary=summary,
+            status="pending_done_notify",
+        )
+        return 0, HELD
+    marked_decision.joel_summary = summary
+    status = _record_and_maybe_mark(
+        ledger=ledger,
+        github=github,
+        note=note,
+        decision=marked_decision,
+        want_mark=config.notification_triage.mark_read_on_action,
+    )
+    return 1, OK if status == "processed" else HELD
+
+
+def _retry_terminal_delivery(
+    config: Config,
+    ledger: Ledger,
+    github: GitHubClient,
+    note: NotifyRow,
+    decision: NotifyTriageDecisionV1,
+) -> Tuple[bool, int]:
+    summary = (decision.joel_summary or "").strip()
+    if not summary or not _paper_trail(config, summary):
+        return False, HELD
+    marked = _decision_with_mark(decision)
+    status = _record_and_maybe_mark(
+        ledger=ledger,
+        github=github,
+        note=note,
+        decision=marked,
+        want_mark=config.notification_triage.mark_read_on_action,
+    )
+    return True, OK if status == "processed" else HELD
 
 
 
@@ -1056,7 +1238,7 @@ def triage_notifications(
     *,
     run_fix_sweep: bool = True,
 ) -> NotifyTriageOutcome:
-    """Classify notifications, dismiss noise, hand ACTION_FIX to PR sweep, ping NEEDS_JOEL."""
+    """Resolve notifications serially; Joel receives only terminal paper trail."""
     ensure_state_dirs(config)
     if not config.notification_triage.enabled:
         return NotifyTriageOutcome(exit_code=OK, message="notify_triage_disabled")
@@ -1081,8 +1263,9 @@ def triage_notifications(
     dismissed = 0
     needs = 0
     notified = 0
-    should_sweep = False
-    notified_keys: set[str] = set()
+    sweep_triggered = False
+    exit_code = OK
+    messages: List[str] = []
 
     for note in notes:
         prior = ledger.get_notification(note.thread_id)
@@ -1104,76 +1287,162 @@ def triage_notifications(
             and prior.get("status") == "pending_mark"
             and prior.get("decision") in {DECISION_NO_ACTION, DECISION_ACTION_FIX, DECISION_NEEDS_JOEL}
         ):
-            decision = NotifyTriageDecisionV1.from_dict(prior)
+            decision = _decision_with_mark(NotifyTriageDecisionV1.from_dict(prior))
             if decision.decision == DECISION_NO_ACTION:
                 want = config.notification_triage.mark_read_on_no_action
             elif decision.decision == DECISION_ACTION_FIX:
                 want = config.notification_triage.mark_read_on_action
             else:
                 want = config.notification_triage.mark_read_on_needs_joel
-            _record_and_maybe_mark(
+            mark_status = _record_and_maybe_mark(
                 ledger=ledger, github=github, note=note, decision=decision, want_mark=want
             )
+            if mark_status != "processed":
+                exit_code = max(exit_code, HELD)
             items.append(
                 NotifyTriageItem(notification=note, decision=decision, already_processed=True)
             )
             continue
 
-        decision = classify_notification(github, config, note)
+        if (
+            prior
+            and prior.get("updated_at") == note.updated_at
+            and prior.get("status") in {"pending_done_notify", "pending_broken_notify"}
+            and prior.get("decision")
+            in {DECISION_NO_ACTION, DECISION_ACTION_FIX, DECISION_NEEDS_JOEL}
+        ):
+            decision = NotifyTriageDecisionV1.from_dict(prior)
+            delivered, delivery_exit = _retry_terminal_delivery(
+                config, ledger, github, note, decision
+            )
+            if delivered:
+                notified += 1
+            exit_code = max(exit_code, delivery_exit)
+            items.append(
+                NotifyTriageItem(notification=note, decision=decision, already_processed=True)
+            )
+            continue
+
+        if (
+            prior
+            and prior.get("updated_at") == note.updated_at
+            and prior.get("status") in {"pending_action", "running_action"}
+            and prior.get("decision") == DECISION_ACTION_FIX
+        ):
+            decision = NotifyTriageDecisionV1.from_dict(prior)
+            already_queued = True
+        else:
+            decision = classify_notification(github, config, note)
+            already_queued = False
         items.append(NotifyTriageItem(notification=note, decision=decision))
 
         if decision.decision == DECISION_NO_ACTION:
             dismissed += 1
-            _record_and_maybe_mark(
+            mark_status = _record_and_maybe_mark(
                 ledger=ledger,
                 github=github,
                 note=note,
                 decision=decision,
                 want_mark=config.notification_triage.mark_read_on_no_action,
             )
+            if mark_status != "processed":
+                exit_code = max(exit_code, HELD)
             continue
 
         if decision.decision == DECISION_ACTION_FIX:
             acted += 1
-            should_sweep = True
-            # Oscar owns all ACTION_FIX work. Joel is not the triage inbox.
-            if int(decision.related_pr_number or 0) > 0 and (
-                decision.related_repository or note.repository
-            ):
-                _enqueue_agent_pr_work(config, decision=decision, note=note)
-            _record_and_maybe_mark(
-                ledger=ledger,
-                github=github,
-                note=note,
-                decision=decision,
-                want_mark=config.notification_triage.mark_read_on_action,
-            )
+            if not already_queued:
+                _record_pending_action(ledger, note, decision)
+            if not run_fix_sweep:
+                continue
+            if ledger.active_job() is not None:
+                messages.append("action_busy")
+                exit_code = max(exit_code, HELD)
+                continue
+            try:
+                action_outcome, used_sweep = _run_action_once(
+                    config, ledger, github, note, decision
+                )
+                sweep_triggered = sweep_triggered or used_sweep
+                delivered, action_exit = _finish_action(
+                    config,
+                    ledger,
+                    github,
+                    note,
+                    decision,
+                    action_outcome,
+                )
+                notified += delivered
+                exit_code = max(exit_code, action_exit)
+                messages.append(f"action:{action_outcome.outcome}")
+            except (RunnerError, GitHubError, OSError, ValueError) as exc:
+                safe_error = redact_text(
+                    str(exc) or exc.__class__.__name__, config.private_markers
+                )
+                row = ledger.get_notification(note.thread_id) or {}
+                attempts = int(row.get("action_attempts") or 0)
+                terminal = (
+                    attempts >= config.notification_triage.max_action_attempts
+                    or ledger.circuit_open()
+                )
+                proposed_fix = (
+                    "Inspect the Agent Ops receipt and runner logs, clear the named "
+                    "failure, then re-run this notification with the same bounded worker."
+                )
+                summary = _badly_broken_message(
+                    repository=decision.related_repository or note.repository,
+                    pr_number=int(decision.related_pr_number or 0),
+                    what_happened=safe_error,
+                    proposed_fix=proposed_fix,
+                    url=decision.related_url,
+                )
+                ledger.record_notification_action_failure(
+                    note.thread_id,
+                    error=safe_error,
+                    terminal=terminal,
+                    joel_summary=summary if terminal else "",
+                )
+                if terminal:
+                    if _paper_trail(config, summary):
+                        notified += 1
+                        terminal_decision = NotifyTriageDecisionV1(
+                            decision=DECISION_ACTION_FIX,
+                            reason=decision.reason,
+                            joel_summary=summary,
+                            mark_read=True,
+                            related_repository=decision.related_repository,
+                            related_pr_number=decision.related_pr_number,
+                            related_url=decision.related_url,
+                        )
+                        mark_status = _record_and_maybe_mark(
+                            ledger=ledger,
+                            github=github,
+                            note=note,
+                            decision=terminal_decision,
+                            want_mark=config.notification_triage.mark_read_on_action,
+                        )
+                        if mark_status != "processed":
+                            exit_code = max(exit_code, HELD)
+                    exit_code = max(exit_code, HELD)
+                    messages.append("action:broken")
+                else:
+                    exit_code = max(exit_code, HELD)
+                    messages.append("action:retry_pending")
             continue
 
         needs += 1
-        summary = decision.joel_summary or (
-            f"Hey Joel, something is badly broken on {note.repository}. What happened: {note.subject_title[:120]}. Proposed fix: Oscar hold pending diagnosis."
+        proposed_fix = (
+            "Oscar should inspect the repository evidence, propose the narrowest safe "
+            "repair and retry through the bounded notification worker."
         )
-        decision = NotifyTriageDecisionV1(
-            decision=decision.decision,
-            reason=decision.reason,
-            joel_summary=summary,
-            mark_read=decision.mark_read,
-            related_repository=decision.related_repository,
-            related_pr_number=decision.related_pr_number,
-            related_url=decision.related_url,
+        summary = decision.joel_summary or _badly_broken_message(
+            repository=decision.related_repository or note.repository,
+            pr_number=int(decision.related_pr_number or 0),
+            what_happened=decision.reason or note.subject_title[:120],
+            proposed_fix=proposed_fix,
+            url=decision.related_url,
         )
-        coalesce_key = (
-            f"{(decision.related_repository or note.repository).lower()}#"
-            f"{int(decision.related_pr_number or 0)}"
-        )
-        if coalesce_key in notified_keys:
-            pinged = True
-        else:
-            pinged = _notify_joel(config, summary)
-            if pinged:
-                notified += 1
-                notified_keys.add(coalesce_key)
+        pinged = _paper_trail(config, summary)
         if not pinged and config.notification_triage.needs_joel_command:
             ledger.record_notification(
                 thread_id=note.thread_id,
@@ -1184,45 +1453,27 @@ def triage_notifications(
                 pr_number=decision.related_pr_number,
                 related_url=decision.related_url,
                 joel_summary=summary,
-                status="pending_notify",
+                status="pending_broken_notify",
             )
+            exit_code = max(exit_code, HELD)
             continue
-        _record_and_maybe_mark(
+        if pinged:
+            notified += 1
+        decision.joel_summary = summary
+        decision.mark_read = True
+        mark_status = _record_and_maybe_mark(
             ledger=ledger,
             github=github,
             note=note,
             decision=decision,
             want_mark=config.notification_triage.mark_read_on_needs_joel,
         )
+        if mark_status != "processed":
+            exit_code = max(exit_code, HELD)
 
-    sweep_triggered = False
     message = "notify_triage_complete"
-    exit_code = OK
-    if should_sweep and run_fix_sweep:
-        sweep_outcome = sweep(config, client=github)
-        sweep_triggered = True
-        message = f"notify_triage_complete;sweep:{sweep_outcome.message}"
-        exit_code = sweep_outcome.exit_code
-        if getattr(sweep_outcome, "jobs_completed", 0):
-            _paper_trail(
-                config,
-                (
-                    f"Hey Joel, Oscar completed {sweep_outcome.jobs_completed} "
-                    f"GitHub fix job(s) for you. {sweep_outcome.message}"
-                ),
-            )
-        elif getattr(sweep_outcome, "jobs_held", 0) and exit_code != OK:
-            _notify_badly_broken(
-                config,
-                repository="agent-ops",
-                pr_number=0,
-                what_happened=(
-                    f"Oscar held {sweep_outcome.jobs_held} job(s): {sweep_outcome.message}"
-                ),
-                proposed_fix=(
-                    "Inspect Agent Ops receipts and re-run after the hold cause is cleared."
-                ),
-            )
+    if messages:
+        message += ";" + ";".join(messages)
 
     return NotifyTriageOutcome(
         exit_code=exit_code,

@@ -7,6 +7,7 @@ Local JSON only. Never commit real config or state directories.
 - `operator_logins` - GitHub logins treated as the authenticated operator
 - `owned_namespaces` - user or org namespaces whose open PRs are inspected
 - `trusted_reviewer_logins` - logins whose latest thread comments are actionable
+- `trusted_reviewer_associations` - optional GitHub associations trusted for maintainer comments: `OWNER`, `MEMBER`, and `COLLABORATOR`
 - `workspace_root` - directory for mirrors and worktrees
 - `state_dir` - ledger, receipts, request files
 - `classifier_command` - argv array for the read-only classifier
@@ -20,7 +21,7 @@ Local JSON only. Never commit real config or state directories.
 - `excluded_repositories` - full `owner/name` list (default empty)
 - `protected_path_patterns` - always blocked paths
 - `default_verification_commands` - map of check id to argv array
-- `repository_policies` - per-repo `permitted_paths` and `verification_commands`
+- `repository_policies` - per-repo `permitted_paths` and `verification_commands`; `*` is an optional fallback for unlisted repositories
 - `notification_mode` - `quiet` | `concise` | `verbose`
 - `reclaim_after_seconds` - interrupted job reclaim threshold (default 6h)
 - `runner_timeout_seconds` - external runner timeout

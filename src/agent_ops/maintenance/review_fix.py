@@ -113,6 +113,7 @@ def inspect_work(config: Config, client: Optional[GitHubClient] = None) -> Inspe
         operator_logins=config.operator_logins,
         owned_namespaces=config.owned_namespaces,
         trusted_reviewer_logins=config.trusted_reviewer_logins,
+        trusted_reviewer_associations=config.trusted_reviewer_associations,
         excluded_repositories=config.excluded_repositories,
     )
     ledger = Ledger(config.state_dir / "ledger.sqlite3")

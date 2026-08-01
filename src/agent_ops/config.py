@@ -55,13 +55,14 @@ class Config:
     runner_timeout_seconds: int = 3600
     gh_command: str = "gh"
     git_command: str = "git"
+    trusted_reviewer_associations: List[str] = field(default_factory=list)
 
     def is_excluded(self, repository: str) -> bool:
         repo = repository.lower()
         return any(repo == ex.lower() for ex in self.excluded_repositories)
 
     def policy_for(self, repository: str) -> Optional[RepoPolicy]:
-        return self.repository_policies.get(repository.lower())
+        return self.repository_policies.get(repository.lower()) or self.repository_policies.get("*")
 
 
 def _require_str_list(data: Mapping[str, Any], key: str, *, allow_empty: bool = False) -> List[str]:
@@ -178,6 +179,7 @@ def load_config(path: Union[str, Path]) -> Config:
         "owned_namespaces",
         "excluded_repositories",
         "trusted_reviewer_logins",
+        "trusted_reviewer_associations",
         "workspace_root",
         "state_dir",
         "protected_path_patterns",
@@ -202,6 +204,23 @@ def load_config(path: Union[str, Path]) -> Config:
     operator_logins = [x.lower() for x in _require_str_list(data, "operator_logins")]
     owned_namespaces = [x.lower() for x in _require_str_list(data, "owned_namespaces")]
     trusted = [x.lower() for x in _require_str_list(data, "trusted_reviewer_logins")]
+    associations = (
+        [
+            item.upper()
+            for item in _require_str_list(
+                data, "trusted_reviewer_associations", allow_empty=True
+            )
+        ]
+        if "trusted_reviewer_associations" in data
+        else []
+    )
+    allowed_associations = {"OWNER", "MEMBER", "COLLABORATOR"}
+    unsupported_associations = sorted(set(associations) - allowed_associations)
+    if unsupported_associations:
+        raise ConfigError(
+            "trusted_reviewer_associations contains unsupported values: "
+            + ",".join(unsupported_associations)
+        )
     excluded = (
         [x.lower() for x in _require_str_list(data, "excluded_repositories", allow_empty=True)]
         if "excluded_repositories" in data
@@ -330,6 +349,7 @@ def load_config(path: Union[str, Path]) -> Config:
         runner_timeout_seconds=timeout,
         gh_command=str(data.get("gh_command", "gh")),
         git_command=str(data.get("git_command", "git")),
+        trusted_reviewer_associations=associations,
     )
 
 

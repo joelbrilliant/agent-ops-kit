@@ -113,6 +113,7 @@ def test_load_config_roundtrip(tmp_path: Path):
                 "owned_namespaces": ["example-user"],
                 "excluded_repositories": [],
                 "trusted_reviewer_logins": ["copilot"],
+                "trusted_reviewer_associations": ["owner", "member", "collaborator"],
                 "workspace_root": str(tmp_path / "w"),
                 "state_dir": str(tmp_path / "s"),
                 "protected_path_patterns": [".env"],
@@ -137,6 +138,10 @@ def test_load_config_roundtrip(tmp_path: Path):
                     "Example-User/Repo": {
                         "permitted_paths": ["src/*"],
                         "verification_commands": {},
+                    },
+                    "*": {
+                        "permitted_paths": ["**"],
+                        "verification_commands": {},
                     }
                 },
             }
@@ -147,6 +152,8 @@ def test_load_config_roundtrip(tmp_path: Path):
     assert cfg.operator_logins == ["operator"]
     assert cfg.default_verification_commands["unit"] == ["true"]
     assert cfg.policy_for("EXAMPLE-USER/REPO") is not None
+    assert cfg.policy_for("another-owner/another-repo").name == "*"
+    assert cfg.trusted_reviewer_associations == ["OWNER", "MEMBER", "COLLABORATOR"]
 
     optional = json.loads(cfg_path.read_text(encoding="utf-8"))
     optional.pop("excluded_repositories")
@@ -171,6 +178,47 @@ def test_load_config_missing_required(tmp_path: Path):
     p.write_text("{}", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(p)
+
+
+def test_load_config_rejects_untrusted_author_association(tmp_path: Path):
+    cfg_path = tmp_path / "cfg.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "operator_logins": ["operator"],
+                "owned_namespaces": ["operator"],
+                "trusted_reviewer_logins": ["reviewer"],
+                "trusted_reviewer_associations": ["CONTRIBUTOR"],
+                "workspace_root": str(tmp_path / "w"),
+                "state_dir": str(tmp_path / "s"),
+                "classifier_command": ["echo", "{request_path}", "{response_path}"],
+                "builder_command": [
+                    "echo",
+                    "{request_path}",
+                    "{response_path}",
+                    "{worktree_path}",
+                ],
+                "reviewer_command": [
+                    "echo",
+                    "{request_path}",
+                    "{response_path}",
+                    "{worktree_path}",
+                ],
+                "required_runner_identity": {
+                    "profile": "oscar",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "xhigh",
+                    "service_tier": "fast",
+                },
+                "capability_isolation": {"enabled": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="trusted_reviewer_associations"):
+        load_config(cfg_path)
 
 
 def test_run_argv_never_shell(tmp_path: Path):

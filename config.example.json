@@ -3,6 +3,7 @@
   "owned_namespaces": ["YOUR_GITHUB_LOGIN"],
   "excluded_repositories": [],
   "trusted_reviewer_logins": ["copilot-pull-request-reviewer"],
+  "trusted_reviewer_associations": ["OWNER", "MEMBER", "COLLABORATOR"],
   "workspace_root": "/absolute/path/to/agent-ops-workspace",
   "state_dir": "/absolute/path/to/agent-ops-state",
   "protected_path_patterns": [

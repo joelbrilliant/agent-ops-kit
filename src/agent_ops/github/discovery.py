@@ -62,6 +62,7 @@ query ReviewThreadCommentsPage($id: ID!, $commentCursor: String) {
           id
           databaseId
           author { login }
+          authorAssociation
           body
           createdAt
           viewerDidAuthor
@@ -234,8 +235,10 @@ def extract_signals_from_pr(
     base_repository: str,
     trusted_reviewer_logins: Sequence[str],
     operator_logins: Sequence[str],
+    trusted_reviewer_associations: Sequence[str] = (),
 ) -> Tuple[List[SignalV1], List[DiscoverSkip]]:
     trusted = {x.lower() for x in trusted_reviewer_logins}
+    trusted_associations = {x.upper() for x in trusted_reviewer_associations}
     operators = {x.lower() for x in operator_logins}
     signals: List[SignalV1] = []
     skips: List[DiscoverSkip] = []
@@ -295,7 +298,8 @@ def extract_signals_from_pr(
             continue
         latest = comments[latest_external_index]
         author = ((latest.get("author") or {}).get("login") or "").lower()
-        if author not in trusted:
+        association = str(latest.get("authorAssociation") or "").upper()
+        if author not in trusted and association not in trusted_associations:
             skips.append(
                 DiscoverSkip(base_repository, pr_number, "untrusted_author", tid)
             )
@@ -340,6 +344,7 @@ def discover_actionable_signals(
     owned_namespaces: Sequence[str],
     trusted_reviewer_logins: Sequence[str],
     excluded_repositories: Sequence[str],
+    trusted_reviewer_associations: Sequence[str] = (),
     pr_number_override: Optional[Dict[str, int]] = None,
 ) -> DiscoverResult:
     excluded = {x.lower() for x in excluded_repositories}
@@ -372,6 +377,7 @@ def discover_actionable_signals(
             base_repository=repo,
             trusted_reviewer_logins=trusted_reviewer_logins,
             operator_logins=operator_logins,
+            trusted_reviewer_associations=trusted_reviewer_associations,
         )
         all_signals.extend(signals)
         all_skips.extend(skips)

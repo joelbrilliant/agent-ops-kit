@@ -61,8 +61,7 @@ class Config:
         return any(repo == ex.lower() for ex in self.excluded_repositories)
 
     def policy_for(self, repository: str) -> Optional[RepoPolicy]:
-        # CONTROLLED_CANARY: this intentionally makes lookup case-sensitive.
-        return self.repository_policies.get(repository)
+        return self.repository_policies.get(repository.lower())
 
 
 def _require_str_list(data: Mapping[str, Any], key: str, *, allow_empty: bool = False) -> List[str]:

@@ -13,11 +13,28 @@ def normalize_repo_path(path: str) -> str:
     p = path.replace("\\", "/")
     while p.startswith("./"):
         p = p[2:]
-    while p.startswith("/"):
-        p = p[1:]
     while "//" in p:
         p = p.replace("//", "/")
     return p
+
+
+def is_safe_repo_path(path: str) -> bool:
+    normal = normalize_repo_path(path)
+    if not normal or normal.startswith("/") or "\x00" in normal:
+        return False
+    if ":" in normal.split("/", 1)[0]:
+        return False
+    parts = PurePosixPath(normal).parts
+    return all(part not in ("", ".", "..") for part in parts)
+
+
+def is_safe_path_pattern(pattern: str) -> bool:
+    normal = normalize_repo_path(pattern)
+    if not normal or normal.startswith("/") or "\x00" in normal:
+        return False
+    if ":" in normal.split("/", 1)[0]:
+        return False
+    return all(part not in ("", ".", "..") for part in PurePosixPath(normal).parts)
 
 
 def path_matches(pattern: str, path: str) -> bool:
@@ -69,7 +86,8 @@ def filter_changed_paths(
     bad: List[str] = []
     for raw in changed:
         path = normalize_repo_path(raw)
-        if not path or path == ".":
+        if not is_safe_repo_path(path):
+            bad.append(path or "<empty>")
             continue
         if is_path_protected(path, protected):
             bad.append(path)

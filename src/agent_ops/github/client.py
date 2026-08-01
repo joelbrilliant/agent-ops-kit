@@ -26,6 +26,9 @@ class GitHubClient(Protocol):
     def viewer_login(self) -> str:
         ...
 
+    def required_checks(self, repository: str, pr_number: int) -> List[Dict[str, Any]]:
+        ...
+
 
 @dataclass
 class GhClient:
@@ -68,6 +71,34 @@ class GhClient:
             raise GitHubError("unable to resolve authenticated user")
         return str(login)
 
+    def required_checks(self, repository: str, pr_number: int) -> List[Dict[str, Any]]:
+        result = run_argv(
+            [
+                self.gh_command,
+                "pr",
+                "checks",
+                str(pr_number),
+                "--repo",
+                repository,
+                "--required",
+                "--json",
+                "bucket,name,state",
+            ],
+            timeout=120,
+            check=False,
+        )
+        try:
+            rows = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise GitHubError("required checks returned invalid JSON") from exc
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise GitHubError("required checks returned invalid shape")
+        if not result.ok and not rows:
+            message = (result.stderr or result.stdout).lower()
+            if "no required checks" not in message:
+                raise GitHubError("required checks query failed")
+        return [dict(row) for row in rows]
+
 
 class FakeGitHub:
     """In-memory GitHub for synthetic tests.
@@ -82,6 +113,7 @@ class FakeGitHub:
         self.login = "operator"
         self.replies: List[Dict[str, Any]] = []
         self.mutations: List[Dict[str, Any]] = []
+        self.required_check_rows: Dict[str, Any] = {}
 
     def rest_search_issues(self, query: str, page: int = 1, per_page: int = 100) -> Dict[str, Any]:
         pages: List[List[Dict[str, Any]]] = self.search_pages.get(query, [])
@@ -113,3 +145,12 @@ class FakeGitHub:
 
     def viewer_login(self) -> str:
         return self.login
+
+    def required_checks(self, repository: str, pr_number: int) -> List[Dict[str, Any]]:
+        key = f"{repository.lower()}#{pr_number}"
+        value = self.required_check_rows.get(
+            key,
+            [{"bucket": "pass", "name": "synthetic-required", "state": "SUCCESS"}],
+        )
+        rows = value() if callable(value) else value
+        return [dict(row) for row in rows]

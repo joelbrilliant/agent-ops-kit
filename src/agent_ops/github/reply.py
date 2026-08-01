@@ -40,16 +40,6 @@ query($id: ID!) {
 """
 
 
-def build_reply_body(*, resulting_sha: str, named_checks: list) -> str:
-    checks = ", ".join(named_checks) if named_checks else "none"
-    short = resulting_sha[:7] if resulting_sha else "unknown"
-    return (
-        f"Agent Ops Kit applied a bounded fix in `{short}`.\n"
-        f"Verification: {checks}.\n"
-        f"Thread left unresolved for human confirmation."
-    )
-
-
 def reply_on_thread(
     client: GitHubClient,
     *,
@@ -78,9 +68,15 @@ def readback_thread(client: GitHubClient, thread_node_id: str) -> Dict[str, Any]
     return node
 
 
-def verify_reply_present(thread: Dict[str, Any], reply_node_id: str) -> bool:
+def verify_reply_present(
+    thread: Dict[str, Any], reply_node_id: str, expected_body: str
+) -> bool:
     comments = ((thread.get("comments") or {}).get("nodes")) or []
-    return any(str(c.get("id")) == reply_node_id for c in comments)
+    return any(
+        str(comment.get("id")) == reply_node_id
+        and str(comment.get("body") or "") == expected_body
+        for comment in comments
+    )
 
 
 def thread_still_actionable(

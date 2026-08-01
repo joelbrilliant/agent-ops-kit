@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any, Dict
 
 from agent_ops.maintenance.ledger import Ledger, make_claim_key
 
@@ -122,3 +124,56 @@ def test_reclaim_interrupted_job(tmp_path: Path):
     assert r2 == "claimed"
     assert detail == "reclaimed"
     assert j2 != j1
+
+
+def test_atomic_claim_race_has_exactly_one_winner(tmp_path: Path):
+    database = tmp_path / "race.sqlite3"
+    kwargs: Dict[str, Any] = dict(
+        repository="o/r",
+        pr_number=1,
+        thread_node_id="thread",
+        latest_comment_node_id="comment",
+        observed_head_sha="a" * 40,
+        signal_digest="b" * 64,
+        reclaim_after_seconds=3600,
+    )
+
+    def claim():
+        return Ledger(database).try_claim(**kwargs)[0]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: claim(), range(8)))
+
+    assert results.count("claimed") == 1
+    assert results.count("duplicate") == 7
+
+
+def test_interruption_after_mutation_boundary_opens_global_circuit(tmp_path: Path):
+    led = Ledger(tmp_path / "l.sqlite3")
+    result, job_id, _ = led.try_claim(
+        repository="o/r",
+        pr_number=1,
+        thread_node_id="thread",
+        latest_comment_node_id="comment",
+        observed_head_sha="a" * 40,
+        signal_digest="b" * 64,
+        reclaim_after_seconds=3600,
+    )
+    assert result == "claimed" and job_id
+    led.mark_running(job_id, make_claim_key("o/r", 1, "thread", "comment", "a" * 40))
+    led.mark_phase(job_id, "pushing")
+
+    import sqlite3
+
+    conn = sqlite3.connect(str(tmp_path / "l.sqlite3"))
+    conn.execute(
+        "UPDATE jobs SET heartbeat_at = ? WHERE job_id = ?",
+        (time.time() - 10_000, job_id),
+    )
+    conn.commit()
+    conn.close()
+
+    assert led.reclaim_stale_jobs(reclaim_after_seconds=60) == 0
+    assert led.active_job() is None
+    assert led.circuit_open()
+    assert led.circuit_reason() == "interrupted_after_mutation_boundary:pushing"

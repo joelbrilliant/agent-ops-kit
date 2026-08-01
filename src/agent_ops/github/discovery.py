@@ -10,12 +10,13 @@ from agent_ops.github.client import GitHubClient, GitHubError
 
 
 PR_THREADS_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
+query PrThreadsPage($owner: String!, $name: String!, $number: Int!, $threadCursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       id
       url
       isDraft
+      baseRefName
       headRefName
       headRefOid
       headRepository {
@@ -29,23 +30,41 @@ query($owner: String!, $name: String!, $number: Int!) {
       author {
         login
       }
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $threadCursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           id
           isResolved
           isOutdated
           path
           line
-          comments(first: 50) {
-            nodes {
-              id
-              databaseId
-              author { login }
-              body
-              createdAt
-              viewerDidAuthor
-            }
-          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+THREAD_COMMENTS_QUERY = """
+query ReviewThreadCommentsPage($id: ID!, $commentCursor: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $commentCursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          databaseId
+          author { login }
+          body
+          createdAt
+          viewerDidAuthor
         }
       }
     }
@@ -81,7 +100,7 @@ def search_open_prs(
     *,
     operator_logins: Sequence[str],
     owned_namespaces: Sequence[str],
-    max_pages: int = 5,
+    max_pages: int = 10,
     per_page: int = 100,
 ) -> List[Dict[str, Any]]:
     """Account-wide open PR discovery; dedupe by pull request URL/id."""
@@ -99,6 +118,11 @@ def search_open_prs(
     for q in queries:
         for page in range(1, max_pages + 1):
             data = client.rest_search_issues(q, page=page, per_page=page_size)
+            if data.get("incomplete_results"):
+                raise GitHubError(f"search results incomplete for query: {q}")
+            total_count = int(data.get("total_count") or 0)
+            if total_count > 1000:
+                raise GitHubError(f"search result exceeds GitHub's 1000-item window: {q}")
             batch = data.get("items") or []
             if not batch:
                 break
@@ -110,6 +134,8 @@ def search_open_prs(
                 items.append(item)
             if len(batch) < page_size:
                 break
+            if page == max_pages and page * page_size < total_count:
+                raise GitHubError(f"search pagination limit reached for query: {q}")
     return items
 
 
@@ -134,14 +160,72 @@ def _pr_number_from_item(item: Dict[str, Any]) -> int:
     raise GitHubError("search item missing number")
 
 
+def _fetch_thread_comments(client: GitHubClient, thread: Dict[str, Any]) -> List[Dict[str, Any]]:
+    existing = thread.get("comments")
+    if isinstance(existing, dict) and "pageInfo" not in existing:
+        return [dict(node) for node in (existing.get("nodes") or [])]
+
+    comments: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    seen_cursors: Set[str] = set()
+    while True:
+        data = client.graphql(
+            THREAD_COMMENTS_QUERY,
+            {"id": str(thread.get("id") or ""), "commentCursor": cursor},
+        )
+        node = (data.get("data") or {}).get("node") or {}
+        connection = node.get("comments") or {}
+        comments.extend(dict(comment) for comment in (connection.get("nodes") or []))
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return comments
+        next_cursor = str(page_info.get("endCursor") or "")
+        if not next_cursor or next_cursor in seen_cursors:
+            raise GitHubError("comment pagination cursor missing or repeated")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+
 def fetch_pr_threads(client: GitHubClient, repository: str, pr_number: int) -> Dict[str, Any]:
     owner, name = _parse_repo(repository)
-    data = client.graphql(PR_THREADS_QUERY, {"owner": owner, "name": name, "number": pr_number})
-    repo = (data.get("data") or {}).get("repository") or {}
-    pr = repo.get("pullRequest")
-    if not pr:
-        raise GitHubError(f"pull request not found: {repository}#{pr_number}")
-    return pr
+    cursor: Optional[str] = None
+    seen_cursors: Set[str] = set()
+    result: Optional[Dict[str, Any]] = None
+    threads: List[Dict[str, Any]] = []
+
+    while True:
+        data = client.graphql(
+            PR_THREADS_QUERY,
+            {
+                "owner": owner,
+                "name": name,
+                "number": pr_number,
+                "threadCursor": cursor,
+            },
+        )
+        repo = (data.get("data") or {}).get("repository") or {}
+        pr = repo.get("pullRequest")
+        if not pr:
+            raise GitHubError(f"pull request not found: {repository}#{pr_number}")
+        if result is None:
+            result = dict(pr)
+        connection = pr.get("reviewThreads") or {}
+        for raw_thread in connection.get("nodes") or []:
+            thread = dict(raw_thread)
+            thread["comments"] = {"nodes": _fetch_thread_comments(client, thread)}
+            threads.append(thread)
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        next_cursor = str(page_info.get("endCursor") or "")
+        if not next_cursor or next_cursor in seen_cursors:
+            raise GitHubError("review-thread pagination cursor missing or repeated")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    assert result is not None
+    result["reviewThreads"] = {"nodes": threads}
+    return result
 
 
 def extract_signals_from_pr(
@@ -165,6 +249,10 @@ def extract_signals_from_pr(
     # number may be absent in nested GraphQL - caller should pass if needed
     threads = ((pr.get("reviewThreads") or {}).get("nodes")) or []
 
+    if not head_sha or not head_ref or not head_repo:
+        skips.append(DiscoverSkip(base_repository, pr_number, "pr_head_incomplete"))
+        return signals, skips
+
     for thread in threads:
         tid = str(thread.get("id") or "")
         if thread.get("isResolved"):
@@ -183,20 +271,42 @@ def extract_signals_from_pr(
                 DiscoverSkip(base_repository, pr_number, "thread_empty", tid)
             )
             continue
-        # Latest external comment: last comment whose author is not solely bot noise;
-        # require trusted reviewer and not an operator self-reply as the latest.
-        latest = comments[-1]
+        latest_external_index: Optional[int] = None
+        for index in range(len(comments) - 1, -1, -1):
+            comment = comments[index]
+            author_login = ((comment.get("author") or {}).get("login") or "").lower()
+            if comment.get("viewerDidAuthor") or author_login in operators:
+                continue
+            latest_external_index = index
+            break
+        if latest_external_index is None:
+            skips.append(
+                DiscoverSkip(base_repository, pr_number, "no_external_comment", tid)
+            )
+            continue
+        if any(
+            comment.get("viewerDidAuthor")
+            or ((comment.get("author") or {}).get("login") or "").lower() in operators
+            for comment in comments[latest_external_index + 1 :]
+        ):
+            skips.append(
+                DiscoverSkip(base_repository, pr_number, "operator_replied_after_review", tid)
+            )
+            continue
+        latest = comments[latest_external_index]
         author = ((latest.get("author") or {}).get("login") or "").lower()
         if author not in trusted:
             skips.append(
                 DiscoverSkip(base_repository, pr_number, "untrusted_author", tid)
             )
             continue
-        if author in operators and len(comments) == 1:
-            # still allow trusted operator accounts if listed as trusted; ok
-            pass
         body = str(latest.get("body") or "")
         path = str(thread.get("path") or "")
+        if not tid or not latest.get("id") or not path:
+            skips.append(
+                DiscoverSkip(base_repository, pr_number, "thread_contract_incomplete", tid)
+            )
+            continue
         line = thread.get("line")
         line_i = int(line) if line is not None else None
         signals.append(
@@ -242,12 +352,8 @@ def discover_actionable_signals(
     seen_pr: Set[str] = set()
 
     for item in items:
-        try:
-            repo = _repo_from_search_item(item)
-            num = _pr_number_from_item(item)
-        except GitHubError as exc:
-            all_skips.append(DiscoverSkip("?", 0, f"search_parse_error:{exc}"))
-            continue
+        repo = _repo_from_search_item(item)
+        num = _pr_number_from_item(item)
         key = f"{repo}#{num}".lower()
         if key in seen_pr:
             continue
@@ -256,21 +362,18 @@ def discover_actionable_signals(
             all_skips.append(DiscoverSkip(repo, num, "repository_excluded"))
             continue
         inspected.append(f"{repo}#{num}")
-        try:
-            pr = fetch_pr_threads(client, repo, num)
-            # Inject number if GraphQL omitted
-            if "number" not in pr:
-                pr = dict(pr)
-                pr["number"] = num
-            signals, skips = extract_signals_from_pr(
-                pr,
-                base_repository=repo,
-                trusted_reviewer_logins=trusted_reviewer_logins,
-                operator_logins=operator_logins,
-            )
-            all_signals.extend(signals)
-            all_skips.extend(skips)
-        except GitHubError as exc:
-            all_skips.append(DiscoverSkip(repo, num, f"graphql_error:{exc}"))
+        pr = fetch_pr_threads(client, repo, num)
+        # Inject number if GraphQL omitted
+        if "number" not in pr:
+            pr = dict(pr)
+            pr["number"] = num
+        signals, skips = extract_signals_from_pr(
+            pr,
+            base_repository=repo,
+            trusted_reviewer_logins=trusted_reviewer_logins,
+            operator_logins=operator_logins,
+        )
+        all_signals.extend(signals)
+        all_skips.extend(skips)
 
     return DiscoverResult(signals=all_signals, skips=all_skips, inspected_prs=inspected)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from agent_ops.github.client import FakeGitHub
+import pytest
+
+from agent_ops.github.client import FakeGitHub, GitHubError
 from agent_ops.github.discovery import (
     discover_actionable_signals,
     extract_signals_from_pr,
@@ -140,6 +142,30 @@ def test_extract_skips_resolved_outdated_untrusted():
     assert signals[0]._raw_body == "fix please"
 
 
+def test_operator_reply_after_review_suppresses_repeat_action():
+    pr = sample_pr()
+    comments = pr["reviewThreads"]["nodes"][0]["comments"]["nodes"]
+    comments.append(
+        {
+            "id": "reply-1",
+            "author": {"login": "operator"},
+            "body": "fixed",
+            "createdAt": "2026-08-01T00:00:01Z",
+            "viewerDidAuthor": True,
+        }
+    )
+
+    signals, skips = extract_signals_from_pr(
+        pr,
+        base_repository="operator/demo",
+        trusted_reviewer_logins=["reviewer"],
+        operator_logins=["operator"],
+    )
+
+    assert signals == []
+    assert any(skip.reason == "operator_replied_after_review" for skip in skips)
+
+
 def test_discover_excludes_repo():
     fake = FakeGitHub()
     pr = sample_pr()
@@ -153,3 +179,38 @@ def test_discover_excludes_repo():
     )
     assert result.signals == []
     assert any(s.reason == "repository_excluded" for s in result.skips)
+
+
+def test_incomplete_account_wide_search_fails_closed():
+    class IncompleteSearch(FakeGitHub):
+        def rest_search_issues(self, query: str, page: int = 1, per_page: int = 100):
+            return {"total_count": 1, "incomplete_results": True, "items": []}
+
+    with pytest.raises(GitHubError, match="search results incomplete"):
+        search_open_prs(
+            IncompleteSearch(),
+            operator_logins=["operator"],
+            owned_namespaces=["operator"],
+        )
+
+
+def test_pr_thread_discovery_failure_fails_the_complete_sweep_snapshot():
+    fake = FakeGitHub()
+    item = {
+        "id": 1,
+        "number": 1,
+        "html_url": "https://github.com/operator/demo/pull/1",
+        "repository_url": "https://api.github.com/repos/operator/demo",
+        "pull_request": {"url": "https://api.github.com/repos/operator/demo/pulls/1"},
+    }
+    fake.search_pages["is:pr is:open author:operator"] = [[item]]
+    fake.search_pages["is:pr is:open user:operator"] = [[item]]
+
+    with pytest.raises(GitHubError, match="no fake graphql handler"):
+        discover_actionable_signals(
+            fake,
+            operator_logins=["operator"],
+            owned_namespaces=["operator"],
+            trusted_reviewer_logins=["reviewer"],
+            excluded_repositories=[],
+        )

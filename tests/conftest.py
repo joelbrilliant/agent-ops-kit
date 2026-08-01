@@ -9,7 +9,7 @@ import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent_ops.config import Config, RepoPolicy
+from agent_ops.config import Config, RepoPolicy, RunnerIdentityPolicy
 from agent_ops.github.client import FakeGitHub
 
 
@@ -52,8 +52,8 @@ def make_config(tmp: Path, **overrides: Any) -> Config:
                 if resp is None:
                     resp = Path(sys.argv[2])
                 data = json.loads(req.read_text())
-                body = (data.get('untrusted_body') or '').lower()
-                path = data.get('path') or ''
+                body = (data.get('untrusted_review_body') or '').lower()
+                path = (data.get('signal') or {}).get('path') or ''
                 hold = any(
                     x in body
                     for x in [
@@ -66,11 +66,24 @@ def make_config(tmp: Path, **overrides: Any) -> Config:
                     ]
                 )
                 out = {
-                    'schema': 'DecisionV1',
-                    'verdict': 'HOLD' if hold else 'ROUTINE',
-                    'reason': 'hold_marker' if hold else 'routine',
-                    'requested_allowed_paths': [path] if path and not hold else [],
-                    'proposed_verification_ids': ['unit'],
+                    'schema': 'ClassifierResponseV1',
+                    'decision': {
+                        'schema': 'DecisionV1',
+                        'verdict': 'HOLD' if hold else 'ROUTINE',
+                        'reason': 'hold_marker' if hold else 'routine',
+                        'requested_allowed_paths': [path] if path and not hold else [],
+                        'proposed_verification_ids': ['unit'],
+                    },
+                    'continuation_token': 'continuation-token-1',
+                    'runner_identity': {
+                        'profile': 'oscar',
+                        'provider': 'openai-codex',
+                        'model': 'gpt-5.6-sol',
+                        'reasoning_effort': 'xhigh',
+                        'service_tier': 'fast',
+                        'session_id': 'classification-session',
+                        'fresh_session': True,
+                    },
                 }
                 resp.write_text(json.dumps(out))
                 """
@@ -83,7 +96,7 @@ def make_config(tmp: Path, **overrides: Any) -> Config:
             textwrap.dedent(
                 """\
                 #!/usr/bin/env python3
-                import json, sys
+                import hashlib, json, subprocess, sys
                 from pathlib import Path
                 args = sys.argv[1:]
                 def get(flag):
@@ -101,7 +114,30 @@ def make_config(tmp: Path, **overrides: Any) -> Config:
                 if new == text:
                     new = text.rstrip() + '\\n# fixed\\n'
                 target.write_text(new)
-                resp.write_text(json.dumps({'ok': True, 'changed': [path]}))
+                subprocess.run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=wt, check=True)
+                subprocess.run(['git', 'config', 'user.name', 'Test Oscar'], cwd=wt, check=True)
+                subprocess.run(['git', 'add', '--', path], cwd=wt, check=True)
+                subprocess.run(['git', 'commit', '-m', 'fix: bounded review feedback'], cwd=wt, check=True)
+                resulting = subprocess.run(
+                    ['git', 'rev-parse', 'HEAD'], cwd=wt, check=True, capture_output=True, text=True
+                ).stdout.strip()
+                token = data['continuation_token']
+                resp.write_text(json.dumps({
+                    'schema': 'BuilderResponseV1',
+                    'runner_identity': {
+                        'profile': 'oscar',
+                        'provider': 'openai-codex',
+                        'model': 'gpt-5.6-sol',
+                        'reasoning_effort': 'xhigh',
+                        'service_tier': 'fast',
+                        'session_id': data['expected_session_id'],
+                        'fresh_session': False,
+                    },
+                    'base_sha': data['task']['base_sha'],
+                    'resulting_sha': resulting,
+                    'changed_paths': [path],
+                    'continuation_token_digest': hashlib.sha256(token.encode()).hexdigest(),
+                }))
                 """
             ),
         )
@@ -118,8 +154,39 @@ def make_config(tmp: Path, **overrides: Any) -> Config:
                 def get(flag):
                     i = args.index(flag)
                     return Path(args[i+1])
+                req = get('--request')
                 resp = get('--response')
-                resp.write_text(json.dumps({'ok': True, 'findings': [], 'fixed': False}))
+                data = json.loads(req.read_text())
+                candidate = data['candidate_sha']
+                check_ids = [row['check_id'] for row in data['verification']]
+                reply = 'fixed at ' + candidate + '. checks: ' + ', '.join(check_ids)
+                resp.write_text(json.dumps({
+                    'schema': 'ReviewerResponseV1',
+                    'runner_identity': {
+                        'profile': 'oscar',
+                        'provider': 'openai-codex',
+                        'model': 'gpt-5.6-sol',
+                        'reasoning_effort': 'xhigh',
+                        'service_tier': 'fast',
+                        'session_id': 'review-session',
+                        'fresh_session': True,
+                    },
+                    'reviewed_sha': candidate,
+                    'resulting_sha': candidate,
+                    'verdict': 'PASS',
+                    'findings': [],
+                    'fixes': [],
+                    'reply_draft': reply,
+                    'voice_gate': {
+                        'schema': 'VoiceGateV1',
+                        'shared_operator_contract_read': True,
+                        'operator_profile_read': True,
+                        'skill': 'joel-voice-writing',
+                        'reference': 'references/voice.md',
+                        'register': 'public-community-short-reply',
+                        'passed': True,
+                    },
+                }))
                 """
             ),
         )
@@ -127,6 +194,9 @@ def make_config(tmp: Path, **overrides: Any) -> Config:
     unit = scripts / "unit.sh"
     if not unit.exists():
         write_executable(unit, "#!/bin/sh\nexit 0\n")
+    gh_denied = scripts / "gh-denied.sh"
+    if not gh_denied.exists():
+        write_executable(gh_denied, "#!/bin/sh\nexit 1\n")
 
     cfg = Config(
         operator_logins=["operator"],
@@ -164,6 +234,16 @@ def make_config(tmp: Path, **overrides: Any) -> Config:
             "--worktree",
             "{worktree_path}",
         ],
+        required_runner_identity=RunnerIdentityPolicy(
+            profile="oscar",
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            reasoning_effort="xhigh",
+            service_tier="fast",
+        ),
+        runner_environment_allowlist=["PATH"],
+        private_markers=["private-marker"],
+        require_github_isolation=True,
         notification_mode="concise",
         default_verification_commands={"unit": [str(unit)]},
         repository_policies={
@@ -175,7 +255,7 @@ def make_config(tmp: Path, **overrides: Any) -> Config:
         },
         reclaim_after_seconds=3600,
         runner_timeout_seconds=60,
-        gh_command="gh",
+        gh_command=str(gh_denied),
         git_command="git",
     )
     if overrides:
@@ -221,6 +301,7 @@ def sample_pr(
         "number": number,
         "url": f"https://github.com/{base_repo}/pull/{number}",
         "isDraft": True,
+        "baseRefName": "main",
         "headRefName": head_ref,
         "headRefOid": head_sha,
         "headRepository": {
@@ -257,6 +338,10 @@ def wire_fake_for_pr(
 
     def gql(query: str, variables: Dict[str, Any]):
         if "addPullRequestReviewThreadReply" in query:
+            tid = variables.get("threadId")
+            target = next((t for t in pr["reviewThreads"]["nodes"] if t["id"] == tid), None)
+            if target is None:
+                return None
             cid = f"reply-{len(fake.replies)+1}"
             fake.replies.append(
                 {
@@ -265,17 +350,14 @@ def wire_fake_for_pr(
                     "thread": variables.get("threadId"),
                 }
             )
-            tid = variables.get("threadId")
-            for t in pr["reviewThreads"]["nodes"]:
-                if t["id"] == tid:
-                    t["comments"]["nodes"].append(
-                        {
-                            "id": cid,
-                            "author": {"login": "operator"},
-                            "body": variables.get("body"),
-                            "createdAt": "2026-08-01T01:00:00Z",
-                        }
-                    )
+            target["comments"]["nodes"].append(
+                {
+                    "id": cid,
+                    "author": {"login": "operator"},
+                    "body": variables.get("body"),
+                    "createdAt": "2026-08-01T01:00:00Z",
+                }
+            )
             return {
                 "data": {
                     "addPullRequestReviewThreadReply": {
@@ -292,8 +374,11 @@ def wire_fake_for_pr(
             for t in pr["reviewThreads"]["nodes"]:
                 if t["id"] == tid:
                     return {"data": {"node": t}}
-            return {"data": {"node": None}}
+            return None
         if "pullRequest" in query:
+            owner, name = base_repo.split("/", 1)
+            if variables.get("owner") != owner or variables.get("name") != name or int(variables.get("number") or 0) != num:
+                return None
             return {"data": {"repository": {"pullRequest": pr}}}
         return None
 

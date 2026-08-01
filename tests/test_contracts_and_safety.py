@@ -8,9 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from agent_ops.audit.receipts import write_receipt
 from agent_ops.audit.redaction import assert_no_private_material, redact_text
-from agent_ops.config import ConfigError, expand_runner_argv, load_config
-from agent_ops.contracts import DecisionV1, SignalV1, body_digest, signal_digest
+from agent_ops.config import ConfigError, _environment_allowlist, expand_runner_argv, load_config
+from agent_ops.contracts import ActionReceiptV1, DecisionV1, SignalV1, body_digest, signal_digest
 from agent_ops.paths import filter_changed_paths, is_path_allowed, resolve_under
 from agent_ops.process import run_argv
 
@@ -62,13 +63,34 @@ def test_resolve_under_blocks_escape(tmp_path: Path):
 
 
 def test_redaction_strips_home_and_tokens():
-    text = "see /Users/example/Projects/x and ghp_abcdefghijklmnopqrstuvwxyz012345"
+    token = "ghp" + "_" + ("x" * 32)
+    text = "see /Users/example/Projects/x and " + token
     out = redact_text(text)
     assert "/Users/example" not in out
     assert "ghp_" not in out
     findings = assert_no_private_material(text)
     assert "token_like_secret" in findings
     assert "home_directory_path" in findings
+
+
+def test_portable_receipt_redacts_configured_private_markers_and_machine_paths(tmp_path: Path):
+    receipt = ActionReceiptV1(
+        signal_digest="d" * 64,
+        base_sha="a" * 40,
+        resulting_sha="",
+        named_checks=[],
+        reply_node_id=None,
+        outcome="held",
+        hold_reason="failure in private-marker at /Users/example/secret/private-note.jsonl",
+    )
+
+    path = write_receipt(tmp_path, receipt, ["private-marker"])
+    raw = path.read_text(encoding="utf-8")
+
+    assert "private-marker" not in raw
+    assert "/Users/example" not in raw
+    assert "[REDACTED]" in raw
+    assert assert_no_private_material(raw, ["private-marker"]) == []
 
 
 def test_expand_runner_placeholders_only(tmp_path: Path):
@@ -94,9 +116,21 @@ def test_load_config_roundtrip(tmp_path: Path):
                 "workspace_root": str(tmp_path / "w"),
                 "state_dir": str(tmp_path / "s"),
                 "protected_path_patterns": [".env"],
-                "classifier_command": ["echo", "{request_path}"],
-                "builder_command": ["echo", "{response_path}"],
-                "reviewer_command": ["echo", "{worktree_path}"],
+                "classifier_command": ["echo", "{request_path}", "{response_path}"],
+                "builder_command": ["echo", "{request_path}", "{response_path}", "{worktree_path}"],
+                "reviewer_command": ["echo", "{request_path}", "{response_path}", "{worktree_path}"],
+                "required_runner_identity": {
+                    "profile": "oscar",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "xhigh",
+                    "service_tier": "fast",
+                },
+                "capability_isolation": {
+                    "enabled": True,
+                    "environment_allowlist": ["PATH"],
+                    "private_markers": [],
+                },
                 "notification_mode": "quiet",
                 "default_verification_commands": {"unit": ["true"]},
             }
@@ -106,6 +140,23 @@ def test_load_config_roundtrip(tmp_path: Path):
     cfg = load_config(cfg_path)
     assert cfg.operator_logins == ["joel"]
     assert cfg.default_verification_commands["unit"] == ["true"]
+
+    optional = json.loads(cfg_path.read_text(encoding="utf-8"))
+    optional.pop("excluded_repositories")
+    optional.pop("protected_path_patterns")
+    cfg_path.write_text(json.dumps(optional), encoding="utf-8")
+    defaults = load_config(cfg_path)
+    assert defaults.excluded_repositories == []
+    assert "**/.env*" in defaults.protected_path_patterns
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["GH_TOKEN", "GITHUB_TOKEN", "DISCORD_BOT_TOKEN", "HOME", "GH_CONFIG_DIR"],
+)
+def test_capability_allowlist_rejects_credentials_and_identity_config(name: str):
+    with pytest.raises(ConfigError, match="credential variables"):
+        _environment_allowlist(["PATH", name])
 
 
 def test_load_config_missing_required(tmp_path: Path):

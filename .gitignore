@@ -22,6 +22,7 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+.scratch/
 
 # OS / editor
 .DS_Store

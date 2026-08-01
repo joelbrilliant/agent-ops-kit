@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
-from agent_ops.audit.redaction import build_redaction_record, redact_text
+from agent_ops.audit.redaction import (
+    assert_no_private_material,
+    build_redaction_record,
+    redact_text,
+)
 from agent_ops.contracts import ActionReceiptV1, dumps_json
 
 
-def write_receipt(state_dir: Path, receipt: ActionReceiptV1) -> Path:
+def write_receipt(
+    state_dir: Path,
+    receipt: ActionReceiptV1,
+    private_markers: Optional[Iterable[str]] = None,
+) -> Path:
     receipts_dir = state_dir / "receipts"
     receipts_dir.mkdir(parents=True, exist_ok=True)
     name = f"{receipt.signal_digest[:16]}-{receipt.outcome}.json"
@@ -18,12 +26,17 @@ def write_receipt(state_dir: Path, receipt: ActionReceiptV1) -> Path:
     payload = receipt.to_dict()
     # Final pass: redact any accidental absolute paths in string fields.
     text = dumps_json(payload)
-    text = redact_text(text)
-    path.write_text(text, encoding="utf-8")
+    text = redact_text(text, private_markers)
+    findings = assert_no_private_material(text, private_markers)
+    if findings:
+        raise ValueError("receipt privacy validation failed:" + ",".join(findings))
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(text, encoding="utf-8")
     try:
-        path.chmod(0o600)
+        temporary.chmod(0o600)
     except OSError:
         pass
+    temporary.replace(path)
     return path
 
 

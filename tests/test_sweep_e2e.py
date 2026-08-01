@@ -97,8 +97,9 @@ def test_sweep_prompt_injection_hold(tmp_path: Path):
     out = sweep(cfg, client=fake)
     assert out.exit_code == 1
     assert "held" in out.message
-    assert out.receipt is not None
-    assert out.receipt.outcome == "held"
+    assert out.receipt_path is not None
+    receipt = json.loads(out.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "held"
 
 
 def test_sweep_happy_path_and_duplicate(tmp_path: Path):
@@ -122,19 +123,12 @@ def test_sweep_happy_path_and_duplicate(tmp_path: Path):
     # Override builder to fix demo.txt and commit happens in orchestrator
     out1 = sweep(cfg, client=fake)
     # May fail if clone_url gets ".git" appended incorrectly
-    if out1.exit_code != 0 and out1.receipt and "worktree" in (out1.receipt.hold_reason or ""):
-        # Retry with patched discovery clone: set head url without double .git
-        pass
-
-    # Directly set clone on PR url without .git suffix issue - discovery does:
-    # head_clone_url=str(head_url) + ".git" if head_url and not endswith .git
-    # bare path /x/remote.git already ends with .git - good
-
     assert out1.exit_code == 0, out1.message
-    assert out1.receipt is not None
-    assert out1.receipt.outcome == "completed"
-    assert out1.receipt.reply_node_id
-    assert out1.receipt.resulting_sha
+    assert out1.receipt_path is not None
+    receipt = json.loads(out1.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["outcome"] == "completed"
+    assert receipt["reply_node_id"]
+    assert receipt["resulting_sha"]
     assert fake.replies, "expected thread reply"
 
     # Receipt privacy
@@ -149,7 +143,7 @@ def test_sweep_happy_path_and_duplicate(tmp_path: Path):
     replies_before = len(fake.replies)
     out2 = sweep(cfg, client=fake)
     assert out2.exit_code == 0
-    assert out2.message in ("no_new_claims", "no_work") or out2.message.startswith("busy")
+    assert out2.message == "no_actionable_signal"
     assert len(fake.replies) == replies_before
 
 
@@ -174,7 +168,9 @@ def test_sweep_unpushable_fork_hold(tmp_path: Path):
     }
     out = sweep(cfg, client=fake)
     assert out.exit_code == 1
-    assert "unpushable" in (out.message + (out.receipt.hold_reason or ""))
+    assert out.receipt_path is not None
+    receipt = json.loads(out.receipt_path.read_text(encoding="utf-8"))
+    assert "push_permission_missing" in (out.message + (receipt["hold_reason"] or ""))
 
 
 def test_sweep_path_escape_opens_circuit(tmp_path: Path):
@@ -186,16 +182,33 @@ def test_sweep_path_escape_opens_circuit(tmp_path: Path):
         textwrap.dedent(
             f"""\
             #!/usr/bin/env python3
-            import json, sys
+            import hashlib, json, subprocess, sys
             from pathlib import Path
             args = sys.argv[1:]
             def get(flag):
                 i = args.index(flag); return Path(args[i+1])
-            resp = get('--response'); wt = get('--worktree')
+            req = get('--request'); resp = get('--response'); wt = get('--worktree')
+            data = json.loads(req.read_text())
             p = wt / 'secrets' / 'x.txt'
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('nope')
-            resp.write_text(json.dumps({{'ok': True}}))
+            subprocess.run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=wt, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'Test Oscar'], cwd=wt, check=True)
+            subprocess.run(['git', 'add', '--', 'secrets/x.txt'], cwd=wt, check=True)
+            subprocess.run(['git', 'commit', '-m', 'bad scope'], cwd=wt, check=True)
+            sha = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=wt, check=True, capture_output=True, text=True).stdout.strip()
+            resp.write_text(json.dumps({{
+                'schema': 'BuilderResponseV1',
+                'runner_identity': {{
+                    'profile': 'oscar', 'provider': 'openai-codex', 'model': 'gpt-5.6-sol',
+                    'reasoning_effort': 'xhigh', 'service_tier': 'fast',
+                    'session_id': data['expected_session_id'], 'fresh_session': False,
+                }},
+                'base_sha': data['task']['base_sha'],
+                'resulting_sha': sha,
+                'changed_paths': ['secrets/x.txt'],
+                'continuation_token_digest': hashlib.sha256(data['continuation_token'].encode()).hexdigest(),
+            }}))
             """
         ),
     )
@@ -221,7 +234,9 @@ def test_sweep_path_escape_opens_circuit(tmp_path: Path):
     wire_fake_for_pr(fake, pr=pr)
     out = sweep(cfg, client=fake)
     assert out.exit_code == 1
-    assert "path_escape" in (out.receipt.hold_reason or out.message)
+    assert out.receipt_path is not None
+    receipt = json.loads(out.receipt_path.read_text(encoding="utf-8"))
+    assert "disallowed_changes" in (receipt["hold_reason"] or out.message)
     led = Ledger(cfg.state_dir / "ledger.sqlite3")
     assert led.circuit_open()
 
@@ -242,7 +257,9 @@ def test_sweep_failing_verification(tmp_path: Path):
     wire_fake_for_pr(fake, pr=pr)
     out = sweep(cfg, client=fake)
     assert out.exit_code == 1
-    assert "verification_failed" in (out.receipt.hold_reason or out.message)
+    assert out.receipt_path is not None
+    receipt = json.loads(out.receipt_path.read_text(encoding="utf-8"))
+    assert "verification_failed" in (receipt["hold_reason"] or out.message)
 
 
 def test_stale_head_before_work(tmp_path: Path):
@@ -276,7 +293,9 @@ def test_stale_head_before_work(tmp_path: Path):
     fake.graphql_handlers = [flaky]
     out = sweep(cfg, client=fake)
     assert out.exit_code == 1
-    assert "head_sha_changed" in (out.receipt.hold_reason or out.message)
+    assert out.receipt_path is not None
+    receipt = json.loads(out.receipt_path.read_text(encoding="utf-8"))
+    assert "pr_snapshot_stale" in (receipt["hold_reason"] or out.message)
 
 
 def test_status_and_pause(tmp_path: Path):
@@ -289,22 +308,20 @@ def test_status_and_pause(tmp_path: Path):
     fake = FakeGitHub()
     out = sweep(cfg, client=fake)
     assert out.exit_code == 0
-    assert out.message == "paused"
+    assert out.message == "paused_inspect_only"
     set_paused(cfg, False)
     st = status_report(cfg)
     assert st["paused"] is False
 
 
-def test_reply_readback_and_build_reply_body():
-    from agent_ops.github.reply import build_reply_body, verify_reply_present
+def test_reply_readback_binds_node_and_exact_body():
+    from agent_ops.github.reply import verify_reply_present
 
-    body = build_reply_body(resulting_sha="abcdef1234567890", named_checks=["unit", "lint"])
-    assert "abcdef1" in body
-    assert "unit" in body
-    assert "/Users/" not in body
-    thread = {"comments": {"nodes": [{"id": "r1"}, {"id": "r2"}]}}
-    assert verify_reply_present(thread, "r2")
-    assert not verify_reply_present(thread, "missing")
+    body = "fixed at abcdef1234567890. checks: unit, lint"
+    thread = {"comments": {"nodes": [{"id": "r1", "body": "old"}, {"id": "r2", "body": body}]}}
+    assert verify_reply_present(thread, "r2", body)
+    assert not verify_reply_present(thread, "r2", "different")
+    assert not verify_reply_present(thread, "missing", body)
 
 
 def test_runner_failure_opens_circuit(tmp_path: Path):
@@ -334,5 +351,7 @@ def test_runner_failure_opens_circuit(tmp_path: Path):
     wire_fake_for_pr(fake, pr=pr)
     out = sweep(cfg, client=fake)
     assert out.exit_code == 1
-    assert "builder_failed" in (out.receipt.hold_reason or out.message)
+    assert out.receipt_path is not None
+    receipt = json.loads(out.receipt_path.read_text(encoding="utf-8"))
+    assert "builder_failed" in (receipt["hold_reason"] or out.message)
     assert Ledger(cfg.state_dir / "ledger.sqlite3").circuit_open()

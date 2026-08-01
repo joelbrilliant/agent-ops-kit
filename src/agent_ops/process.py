@@ -38,17 +38,22 @@ def run_argv(
     if not all(isinstance(x, str) for x in argv):
         raise RunnerError("argv must be strings only")
     # Hard ban on shell metacharacter single-string commands
-    completed = subprocess.run(
-        list(argv),
-        cwd=str(cwd) if cwd is not None else None,
-        env=dict(env) if env is not None else None,
-        input=stdin_data,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        shell=False,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            list(argv),
+            cwd=str(cwd) if cwd is not None else None,
+            env=dict(env) if env is not None else None,
+            input=stdin_data,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            shell=False,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError(f"command timed out: {argv[0]}") from exc
+    except OSError as exc:
+        raise RunnerError(f"command could not start: {argv[0]}: {exc.__class__.__name__}") from exc
     result = ProcResult(
         argv=list(argv),
         returncode=int(completed.returncode),

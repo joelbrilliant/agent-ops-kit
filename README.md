@@ -4,7 +4,7 @@ Evidence-gated operations for local AI agent stacks.
 
 ## Slice 1 - PR improvement canary
 
-Discover actionable unresolved review threads on open pull requests, run a bounded economical build and review-fix pass in an isolated worktree, verify, push without force, and reply on the exact thread.
+Discover every actionable unresolved review thread across the configured GitHub account, process each job serially through two attested Oscar sessions, verify the exact resulting commit, push without force, and reply on the exact thread.
 
 ### Install
 
@@ -40,11 +40,18 @@ A three-hour Hermes cron example is in `docs/cron-hermes.md`.
 - Untrusted GitHub text is written only to owner-only request files or stdin.
 - Runner commands are argv arrays with fixed placeholders only.
 - Subprocess calls always use `shell=False`.
-- One active job at a time; global circuit breaker on safety failures.
-- No force push, merge, deploy, or automatic thread resolution.
+- Oscar runner environments inherit no GitHub credentials, operator home, or messaging capability.
+- Classifier and builder share one session. Reviewer-fixer uses a second fresh session.
+- Strict runner schemas attest exact route, session identity, candidate SHA, resulting SHA, and reply voice gate.
+- One active job at a time with atomic deduplication, interruption recovery, and a global circuit breaker.
+- Paused and circuit-open sweeps inspect only.
+- Thread, head SHA, head repository permission, required checks, remote ref, clean worktree, and history are revalidated immediately before mutation.
+- Pushes target the attested head repository and existing head ref without force.
+- No merge, deploy, repository-setting change, force push, or automatic thread resolution.
 
 ### Tests
 
 ```bash
-pytest
+python3 -m pytest -q
+python3 -m build
 ```

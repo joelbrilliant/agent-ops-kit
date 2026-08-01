@@ -9,8 +9,10 @@ import sys
 from typing import List, Optional
 
 from agent_ops import __version__
+from agent_ops.audit.redaction import redact_text
 from agent_ops.config import ConfigError, load_config
 from agent_ops.exit_codes import HELD, OK, USAGE_OR_TOOLING
+from agent_ops.github.client import GitHubError
 from agent_ops.maintenance.ledger import Ledger
 from agent_ops.maintenance.orchestrator import (
     inspect_work,
@@ -19,6 +21,7 @@ from agent_ops.maintenance.orchestrator import (
     status_report,
     sweep,
 )
+from agent_ops.process import RunnerError
 
 
 def _print_json(data: object) -> None:
@@ -26,13 +29,10 @@ def _print_json(data: object) -> None:
 
 
 def _require_tools(config_gh: str = "gh", config_git: str = "git") -> Optional[str]:
-    if shutil.which(config_gh) is None and config_gh == "gh":
-        # allow fake/test absolute paths that exist
-        pass
-    if config_gh == "gh" and shutil.which("gh") is None:
-        return "gh CLI not found on PATH"
-    if config_git == "git" and shutil.which("git") is None:
-        return "git not found on PATH"
+    if shutil.which(config_gh) is None:
+        return "configured gh CLI not found"
+    if shutil.which(config_git) is None:
+        return "configured git executable not found"
     return None
 
 
@@ -94,13 +94,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return USAGE_OR_TOOLING
 
     if args.pr_command == "inspect":
-        if is_paused(config):
-            _print_json({"paused": True, "signals": [], "inspected_prs": [], "skips": []})
-            return OK
-        result = inspect_work(config)
+        try:
+            result = inspect_work(config)
+        except (GitHubError, RunnerError, OSError, ValueError) as exc:
+            detail = redact_text(str(exc) or exc.__class__.__name__, config.private_markers)
+            sys.stderr.write(f"inspect error: {detail}\n")
+            return HELD
         _print_json(
             {
-                "paused": False,
+                "paused": is_paused(config),
                 "inspected_prs": result.inspected_prs,
                 "signals": [s.to_public_dict() for s in result.signals],
                 "skips": [
@@ -121,12 +123,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return OK
 
     if args.pr_command == "pause":
-        path = set_paused(config, True)
-        sys.stdout.write(f"paused:{path}\n")
+        set_paused(config, True)
+        sys.stdout.write("paused\n")
         return OK
 
     if args.pr_command == "resume":
-        path = set_paused(config, False)
+        set_paused(config, False)
         sys.stdout.write("resumed\n")
         return OK
 
@@ -139,8 +141,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.pr_command == "sweep":
         outcome = sweep(config)
         # Operator visibility: silent for no work; concise otherwise
-        if outcome.message in ("no_work", "paused", "no_new_claims") or outcome.message.startswith(
-            "busy:"
+        if outcome.message in (
+            "no_actionable_signal",
+            "paused_inspect_only",
+            "busy_inspect_only",
         ):
             if config.notification_mode == "verbose":
                 sys.stdout.write(outcome.message + "\n")

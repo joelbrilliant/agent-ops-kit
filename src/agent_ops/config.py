@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Union
 
 
 class ConfigError(ValueError):
@@ -19,6 +20,15 @@ class RepoPolicy:
     name: str
     permitted_paths: List[str] = field(default_factory=list)
     verification_commands: Dict[str, List[str]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RunnerIdentityPolicy:
+    profile: str
+    provider: str
+    model: str
+    reasoning_effort: str
+    service_tier: str
 
 
 @dataclass(frozen=True)
@@ -36,6 +46,10 @@ class Config:
     notification_mode: str
     default_verification_commands: Dict[str, List[str]]
     repository_policies: Dict[str, RepoPolicy]
+    required_runner_identity: RunnerIdentityPolicy
+    runner_environment_allowlist: List[str]
+    private_markers: List[str]
+    require_github_isolation: bool
     pause_file_name: str = "PAUSED"
     reclaim_after_seconds: int = 6 * 60 * 60
     runner_timeout_seconds: int = 3600
@@ -63,13 +77,29 @@ def _require_str_list(data: Mapping[str, Any], key: str, *, allow_empty: bool = 
     return list(value)
 
 
-def _require_cmd(data: Mapping[str, Any], key: str) -> List[str]:
+def _require_cmd(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    required_placeholders: Sequence[str],
+    forbidden_placeholders: Sequence[str] = (),
+) -> List[str]:
     if key not in data:
         raise ConfigError(f"missing required config key: {key}")
     value = data[key]
     if not isinstance(value, list) or not value or not all(isinstance(x, str) for x in value):
         raise ConfigError(f"{key} must be a non-empty array of strings (argv)")
-    return list(value)
+    command = list(value)
+    joined = "\n".join(command)
+    missing = [placeholder for placeholder in required_placeholders if placeholder not in joined]
+    forbidden = [placeholder for placeholder in forbidden_placeholders if placeholder in joined]
+    if missing:
+        raise ConfigError(f"{key} is missing placeholders: {','.join(missing)}")
+    if forbidden:
+        raise ConfigError(f"{key} contains forbidden placeholders: {','.join(forbidden)}")
+    if any("\x00" in part or "\n" in part or "\r" in part for part in command):
+        raise ConfigError(f"{key} contains a control character")
+    return command
 
 
 def _parse_verification_map(raw: Any, label: str) -> Dict[str, List[str]]:
@@ -87,7 +117,54 @@ def _parse_verification_map(raw: Any, label: str) -> Dict[str, List[str]]:
     return out
 
 
-def load_config(path: str | Path) -> Config:
+def _runner_identity_policy(raw: Any) -> RunnerIdentityPolicy:
+    if not isinstance(raw, dict):
+        raise ConfigError("required_runner_identity must be an object")
+    expected = {"profile", "provider", "model", "reasoning_effort", "service_tier"}
+    if set(raw) != expected:
+        raise ConfigError(
+            "required_runner_identity must contain exactly profile, provider, model, "
+            "reasoning_effort, service_tier"
+        )
+    values = {key: str(raw[key]).strip() for key in expected}
+    if not all(values.values()):
+        raise ConfigError("required_runner_identity values must not be empty")
+    return RunnerIdentityPolicy(**values)
+
+
+_CREDENTIAL_ENV_NAMES: Set[str] = {
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GITHUB_PAT",
+    "SSH_AUTH_SOCK",
+}
+
+
+def _environment_allowlist(raw: Any) -> List[str]:
+    if raw is None:
+        return ["PATH", "TMPDIR", "LANG", "LC_ALL"]
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ConfigError("capability_isolation.environment_allowlist must be an array of strings")
+    names = [item.strip() for item in raw if item.strip()]
+    secret_name = re.compile(r"(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH|API_KEY|PRIVATE_KEY)")
+    isolation_name = re.compile(r"^(?:HOME|HERMES_HOME|GH_CONFIG_DIR|XDG_CONFIG_HOME|GIT_CONFIG.*)$")
+    denied = sorted(
+        name
+        for name in names
+        if name.upper() in _CREDENTIAL_ENV_NAMES
+        or secret_name.search(name.upper())
+        or isolation_name.match(name.upper())
+    )
+    if denied:
+        raise ConfigError(
+            "capability_isolation.environment_allowlist contains credential variables: "
+            + ",".join(denied)
+        )
+    return names
+
+
+def load_config(path: Union[str, Path]) -> Config:
     cfg_path = Path(path).expanduser().resolve()
     if not cfg_path.is_file():
         raise ConfigError(f"config file not found: {cfg_path}")
@@ -98,12 +175,40 @@ def load_config(path: str | Path) -> Config:
     if not isinstance(data, dict):
         raise ConfigError("config root must be an object")
 
+    allowed_keys = {
+        "operator_logins",
+        "owned_namespaces",
+        "excluded_repositories",
+        "trusted_reviewer_logins",
+        "workspace_root",
+        "state_dir",
+        "protected_path_patterns",
+        "classifier_command",
+        "builder_command",
+        "reviewer_command",
+        "required_runner_identity",
+        "capability_isolation",
+        "notification_mode",
+        "default_verification_commands",
+        "repository_policies",
+        "pause_file_name",
+        "reclaim_after_seconds",
+        "runner_timeout_seconds",
+        "gh_command",
+        "git_command",
+    }
+    unknown_keys = sorted(set(data) - allowed_keys)
+    if unknown_keys:
+        raise ConfigError("unknown config keys: " + ",".join(unknown_keys))
+
     operator_logins = [x.lower() for x in _require_str_list(data, "operator_logins")]
     owned_namespaces = [x.lower() for x in _require_str_list(data, "owned_namespaces")]
     trusted = [x.lower() for x in _require_str_list(data, "trusted_reviewer_logins")]
-    excluded = [x.lower() for x in _require_str_list(data, "excluded_repositories", allow_empty=True)]
-    if "excluded_repositories" not in data:
-        excluded = []
+    excluded = (
+        [x.lower() for x in _require_str_list(data, "excluded_repositories", allow_empty=True)]
+        if "excluded_repositories" in data
+        else []
+    )
 
     workspace_root = Path(str(data.get("workspace_root", ""))).expanduser()
     if not str(data.get("workspace_root", "")).strip():
@@ -111,14 +216,55 @@ def load_config(path: str | Path) -> Config:
     state_dir = Path(str(data.get("state_dir", ""))).expanduser()
     if not str(data.get("state_dir", "")).strip():
         raise ConfigError("state_dir is required")
+    if not workspace_root.is_absolute() or not state_dir.is_absolute():
+        raise ConfigError("workspace_root and state_dir must be absolute paths")
+    if workspace_root.resolve() == state_dir.resolve():
+        raise ConfigError("workspace_root and state_dir must be different paths")
+    common_root = Path(os.path.commonpath([workspace_root.resolve(), state_dir.resolve()]))
+    if common_root in (workspace_root.resolve(), state_dir.resolve()):
+        raise ConfigError("workspace_root and state_dir must not contain one another")
 
-    protected = _require_str_list(data, "protected_path_patterns", allow_empty=True)
-    if "protected_path_patterns" not in data:
-        protected = [".github/workflows/*", "**/credentials*", "**/.env*"]
+    protected = (
+        _require_str_list(data, "protected_path_patterns", allow_empty=True)
+        if "protected_path_patterns" in data
+        else [".github/workflows/*", "**/credentials*", "**/.env*"]
+    )
 
-    classifier = _require_cmd(data, "classifier_command")
-    builder = _require_cmd(data, "builder_command")
-    reviewer = _require_cmd(data, "reviewer_command")
+    classifier = _require_cmd(
+        data,
+        "classifier_command",
+        required_placeholders=("{request_path}", "{response_path}"),
+        forbidden_placeholders=("{worktree_path}",),
+    )
+    builder = _require_cmd(
+        data,
+        "builder_command",
+        required_placeholders=("{request_path}", "{response_path}", "{worktree_path}"),
+    )
+    reviewer = _require_cmd(
+        data,
+        "reviewer_command",
+        required_placeholders=("{request_path}", "{response_path}", "{worktree_path}"),
+    )
+
+    required_runner_identity = _runner_identity_policy(data.get("required_runner_identity"))
+    isolation = data.get("capability_isolation")
+    if not isinstance(isolation, dict) or isolation.get("enabled") is not True:
+        raise ConfigError("capability_isolation.enabled must be true")
+    allowed_isolation_keys = {"enabled", "environment_allowlist", "private_markers"}
+    unknown_isolation_keys = sorted(set(isolation) - allowed_isolation_keys)
+    if unknown_isolation_keys:
+        raise ConfigError(
+            "unknown capability_isolation keys: " + ",".join(unknown_isolation_keys)
+        )
+    runner_environment_allowlist = _environment_allowlist(
+        isolation.get("environment_allowlist")
+    )
+    private_markers = isolation.get("private_markers", [])
+    if not isinstance(private_markers, list) or not all(
+        isinstance(marker, str) for marker in private_markers
+    ):
+        raise ConfigError("capability_isolation.private_markers must be an array of strings")
 
     notification_mode = str(data.get("notification_mode", "quiet"))
     if notification_mode not in ("quiet", "concise", "verbose"):
@@ -135,9 +281,18 @@ def load_config(path: str | Path) -> Config:
     for name, pol in raw_policies.items():
         if not isinstance(pol, dict):
             raise ConfigError(f"repository_policies.{name} must be an object")
-        repo_policies[str(name)] = RepoPolicy(
+        unknown_policy_keys = sorted(set(pol) - {"permitted_paths", "verification_commands"})
+        if unknown_policy_keys:
+            raise ConfigError(
+                f"unknown repository_policies.{name} keys: " + ",".join(unknown_policy_keys)
+            )
+        permitted = pol.get("permitted_paths", [])
+        if not isinstance(permitted, list) or not all(isinstance(item, str) for item in permitted):
+            raise ConfigError(f"repository_policies.{name}.permitted_paths must be an array of strings")
+        normalized_name = str(name).lower()
+        repo_policies[normalized_name] = RepoPolicy(
             name=str(name),
-            permitted_paths=[str(p) for p in pol.get("permitted_paths", [])],
+            permitted_paths=list(permitted),
             verification_commands=_parse_verification_map(
                 pol.get("verification_commands", {}), f"repository_policies.{name}.verification_commands"
             ),
@@ -149,6 +304,10 @@ def load_config(path: str | Path) -> Config:
     timeout = int(data.get("runner_timeout_seconds", 3600))
     if timeout < 1:
         raise ConfigError("runner_timeout_seconds must be >= 1")
+
+    pause_file_name = str(data.get("pause_file_name", "PAUSED"))
+    if not pause_file_name or Path(pause_file_name).name != pause_file_name:
+        raise ConfigError("pause_file_name must be a simple file name")
 
     return Config(
         operator_logins=operator_logins,
@@ -164,7 +323,11 @@ def load_config(path: str | Path) -> Config:
         notification_mode=notification_mode,
         default_verification_commands=default_verification,
         repository_policies=repo_policies,
-        pause_file_name=str(data.get("pause_file_name", "PAUSED")),
+        required_runner_identity=required_runner_identity,
+        runner_environment_allowlist=runner_environment_allowlist,
+        private_markers=[str(marker) for marker in private_markers if str(marker)],
+        require_github_isolation=True,
+        pause_file_name=pause_file_name,
         reclaim_after_seconds=reclaim,
         runner_timeout_seconds=timeout,
         gh_command=str(data.get("gh_command", "gh")),

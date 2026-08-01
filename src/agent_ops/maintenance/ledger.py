@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY,
   claim_key TEXT NOT NULL,
   status TEXT NOT NULL,
+  phase TEXT NOT NULL,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL,
   heartbeat_at REAL NOT NULL,
@@ -47,7 +48,20 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_job ON jobs(status) WHERE status = 'active';
 """
+
+
+_SAFE_RECLAIM_PHASES = {
+    "claimed",
+    "classifying",
+    "preparing",
+    "building",
+    "verifying",
+    "reviewing",
+    "final_verifying",
+    "pre_push",
+}
 
 
 def make_claim_key(
@@ -96,14 +110,30 @@ class Ledger:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(SCHEMA)
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                with self._connect() as conn:
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.executescript(SCHEMA)
+                    columns = {
+                        str(row["name"])
+                        for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+                    }
+                    if "phase" not in columns:
+                        conn.execute(
+                            "ALTER TABLE jobs ADD COLUMN phase TEXT NOT NULL DEFAULT 'claimed'"
+                        )
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -196,25 +226,52 @@ class Ledger:
             return dict(row)
 
     def reclaim_stale_jobs(self, reclaim_after_seconds: int) -> int:
-        """Mark interrupted active jobs older than threshold as interrupted; free the active slot."""
+        """Reclaim only pre-mutation jobs. Mutation-ambiguous jobs open the circuit."""
         now = time.time()
         cutoff = now - reclaim_after_seconds
         reclaimed = 0
         with self._tx() as conn:
             rows = conn.execute(
-                "SELECT job_id, claim_key, heartbeat_at FROM jobs WHERE status = 'active'"
+                "SELECT job_id, claim_key, heartbeat_at, phase FROM jobs WHERE status = 'active'"
             ).fetchall()
             for row in rows:
-                if float(row["heartbeat_at"]) <= cutoff:
+                if float(row["heartbeat_at"]) > cutoff:
+                    continue
+                phase = str(row["phase"] or "claimed")
+                if phase not in _SAFE_RECLAIM_PHASES:
+                    reason = f"interrupted_after_mutation_boundary:{phase}"
                     conn.execute(
-                        "UPDATE jobs SET status = 'interrupted', updated_at = ?, detail = ? WHERE job_id = ?",
-                        (now, "reclaimed_after_timeout", row["job_id"]),
+                        "UPDATE jobs SET status = 'failed', phase = 'failed', updated_at = ?, detail = ? WHERE job_id = ?",
+                        (now, reason, row["job_id"]),
                     )
                     conn.execute(
-                        "UPDATE claims SET status = 'interrupted', updated_at = ?, hold_reason = ? WHERE claim_key = ?",
-                        (now, "job_interrupted_reclaimable", row["claim_key"]),
+                        "UPDATE claims SET status = 'failed', updated_at = ?, hold_reason = ?, outcome = 'circuit' WHERE claim_key = ?",
+                        (now, reason, row["claim_key"]),
                     )
-                    reclaimed += 1
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES('circuit_breaker', 'open') "
+                        "ON CONFLICT(key) DO UPDATE SET value='open'"
+                    )
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES('circuit_reason', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (reason,),
+                    )
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES('circuit_opened_at', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (str(now),),
+                    )
+                    continue
+                conn.execute(
+                    "UPDATE jobs SET status = 'interrupted', phase = 'interrupted', updated_at = ?, detail = ? WHERE job_id = ?",
+                    (now, "reclaimed_after_timeout", row["job_id"]),
+                )
+                conn.execute(
+                    "UPDATE claims SET status = 'interrupted', updated_at = ?, hold_reason = ? WHERE claim_key = ?",
+                    (now, "job_interrupted_reclaimable", row["claim_key"]),
+                )
+                reclaimed += 1
         return reclaimed
 
     def try_claim(
@@ -238,8 +295,6 @@ class Ledger:
           - circuit_open
         """
         self.reclaim_stale_jobs(reclaim_after_seconds)
-        if self.circuit_open():
-            return "circuit_open", None, self.circuit_reason()
 
         claim_key = make_claim_key(
             repository, pr_number, thread_node_id, latest_comment_node_id, observed_head_sha
@@ -248,6 +303,14 @@ class Ledger:
         job_id = str(uuid.uuid4())
 
         with self._tx() as conn:
+            circuit = conn.execute(
+                "SELECT value FROM meta WHERE key = 'circuit_breaker'"
+            ).fetchone()
+            if circuit and circuit["value"] == "open":
+                reason = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'circuit_reason'"
+                ).fetchone()
+                return "circuit_open", None, str(reason["value"]) if reason else None
             # Same claim key first - duplicate beats busy so retries are idempotent
             existing = conn.execute(
                 "SELECT * FROM claims WHERE claim_key = ?", (claim_key,)
@@ -268,8 +331,8 @@ class Ledger:
                         (now, job_id, claim_key),
                     )
                     conn.execute(
-                        "INSERT INTO jobs(job_id, claim_key, status, created_at, updated_at, heartbeat_at, detail) VALUES (?,?,?,?,?,?,?)",
-                        (job_id, claim_key, "active", now, now, now, "reclaimed"),
+                        "INSERT INTO jobs(job_id, claim_key, status, phase, created_at, updated_at, heartbeat_at, detail) VALUES (?,?,?,?,?,?,?,?)",
+                        (job_id, claim_key, "active", "claimed", now, now, now, "reclaimed"),
                     )
                     return "claimed", job_id, "reclaimed"
 
@@ -302,8 +365,8 @@ class Ledger:
                 ),
             )
             conn.execute(
-                "INSERT INTO jobs(job_id, claim_key, status, created_at, updated_at, heartbeat_at, detail) VALUES (?,?,?,?,?,?,?)",
-                (job_id, claim_key, "active", now, now, now, "claimed"),
+                "INSERT INTO jobs(job_id, claim_key, status, phase, created_at, updated_at, heartbeat_at, detail) VALUES (?,?,?,?,?,?,?,?)",
+                (job_id, claim_key, "active", "claimed", now, now, now, "claimed"),
             )
             return "claimed", job_id, None
 
@@ -315,12 +378,23 @@ class Ledger:
                 (now, now, job_id),
             )
 
+    def mark_phase(self, job_id: str, phase: str) -> None:
+        if not phase or any(character.isspace() for character in phase):
+            raise ValueError("invalid job phase")
+        now = time.time()
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE jobs SET phase = ?, heartbeat_at = ?, updated_at = ?, detail = ? "
+                "WHERE job_id = ? AND status = 'active'",
+                (phase, now, now, phase, job_id),
+            )
+
     def mark_running(self, job_id: str, claim_key: str) -> None:
         now = time.time()
         with self._tx() as conn:
             conn.execute(
-                "UPDATE jobs SET status = 'active', updated_at = ?, heartbeat_at = ?, detail = ? WHERE job_id = ?",
-                (now, now, "running", job_id),
+                "UPDATE jobs SET status = 'active', phase = 'classifying', updated_at = ?, heartbeat_at = ?, detail = ? WHERE job_id = ?",
+                (now, now, "classifying", job_id),
             )
             conn.execute(
                 "UPDATE claims SET status = 'running', updated_at = ? WHERE claim_key = ?",
@@ -341,8 +415,8 @@ class Ledger:
         status = "completed" if outcome == "completed" else "held"
         with self._tx() as conn:
             conn.execute(
-                "UPDATE jobs SET status = ?, updated_at = ?, detail = ? WHERE job_id = ?",
-                (outcome, now, outcome, job_id),
+                "UPDATE jobs SET status = ?, phase = ?, updated_at = ?, detail = ? WHERE job_id = ?",
+                (outcome, outcome, now, outcome, job_id),
             )
             conn.execute(
                 """
@@ -372,7 +446,7 @@ class Ledger:
             )
             if job_id:
                 conn.execute(
-                    "UPDATE jobs SET status = 'failed', updated_at = ?, detail = ? WHERE job_id = ?",
+                    "UPDATE jobs SET status = 'failed', phase = 'failed', updated_at = ?, detail = ? WHERE job_id = ?",
                     (now, reason, job_id),
                 )
             if claim_key:

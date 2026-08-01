@@ -39,11 +39,30 @@
     "--worktree",
     "{worktree_path}"
   ],
+  "required_runner_identity": {
+    "profile": "oscar",
+    "provider": "openai-codex",
+    "model": "gpt-5.6-sol",
+    "reasoning_effort": "xhigh",
+    "service_tier": "fast"
+  },
+  "capability_isolation": {
+    "enabled": true,
+    "environment_allowlist": ["PATH", "LANG", "LC_ALL"],
+    "private_markers": ["YOUR_PRIVATE_WORKSPACE_MARKER"]
+  },
   "notification_mode": "concise",
   "default_verification_commands": {
     "unit": ["python3", "-m", "pytest", "-q"]
   },
-  "repository_policies": {},
+  "repository_policies": {
+    "YOUR_GITHUB_LOGIN/YOUR_REPOSITORY": {
+      "permitted_paths": ["src/*", "tests/*"],
+      "verification_commands": {
+        "package": ["python3", "-m", "build"]
+      }
+    }
+  },
   "reclaim_after_seconds": 21600,
   "runner_timeout_seconds": 3600
 }

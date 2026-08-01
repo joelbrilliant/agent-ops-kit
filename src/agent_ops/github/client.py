@@ -165,6 +165,19 @@ class GhClient:
 
     def mark_notification_read(self, thread_id: str) -> None:
         result = run_argv(
+            [
+                self.gh_command,
+                "api",
+                "-X",
+                "PATCH",
+                f"notifications/threads/{thread_id}",
+                "--silent",
+            ],
+            timeout=60,
+            check=False,
+        )
+        if not result.ok:
+            raise GitHubError(result.stderr.strip() or "mark notification read failed")
 
     def get_notification_thread(self, thread_id: str) -> Dict[str, Any]:
         result = run_argv(
@@ -183,20 +196,6 @@ class GhClient:
         if not result.ok or not isinstance(payload, dict):
             raise GitHubError(f"get notification thread failed: {thread_id}")
         return dict(payload)
-
-            [
-                self.gh_command,
-                "api",
-                "-X",
-                "PATCH",
-                f"notifications/threads/{thread_id}",
-                "--silent",
-            ],
-            timeout=60,
-            check=False,
-        )
-        if not result.ok:
-            raise GitHubError(result.stderr.strip() or "mark notification read failed")
 
 
 class FakeGitHub:

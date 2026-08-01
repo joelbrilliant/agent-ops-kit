@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from agent_ops.config import ALLOWED_TRUSTED_REVIEWER_ASSOCIATIONS
 from agent_ops.contracts import SignalV1, body_digest
 from agent_ops.github.client import GitHubClient, GitHubError
 
@@ -238,7 +239,9 @@ def extract_signals_from_pr(
     trusted_reviewer_associations: Sequence[str] = (),
 ) -> Tuple[List[SignalV1], List[DiscoverSkip]]:
     trusted = {x.lower() for x in trusted_reviewer_logins}
-    trusted_associations = {x.upper() for x in trusted_reviewer_associations}
+    trusted_associations = {
+        x.upper() for x in trusted_reviewer_associations
+    } & ALLOWED_TRUSTED_REVIEWER_ASSOCIATIONS
     operators = {x.lower() for x in operator_logins}
     signals: List[SignalV1] = []
     skips: List[DiscoverSkip] = []
@@ -299,7 +302,9 @@ def extract_signals_from_pr(
         latest = comments[latest_external_index]
         author = ((latest.get("author") or {}).get("login") or "").lower()
         association = str(latest.get("authorAssociation") or "").upper()
-        if author not in trusted and association not in trusted_associations:
+        if not author or (
+            author not in trusted and association not in trusted_associations
+        ):
             skips.append(
                 DiscoverSkip(base_repository, pr_number, "untrusted_author", tid)
             )

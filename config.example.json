@@ -62,6 +62,10 @@
       "verification_commands": {
         "package": ["python3", "-m", "build"]
       }
+    },
+    "*": {
+      "permitted_paths": ["docs/*"],
+      "verification_commands": {}
     }
   },
   "reclaim_after_seconds": 21600,

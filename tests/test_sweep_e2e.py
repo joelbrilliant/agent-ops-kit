@@ -65,6 +65,25 @@ def test_inspect_finds_signal(tmp_path: Path):
     assert result.signals[0].path == "demo.txt"
 
 
+def test_inspect_uses_configured_maintainer_association(tmp_path: Path):
+    cfg = make_config(
+        tmp_path,
+        trusted_reviewer_logins=[],
+        trusted_reviewer_associations=["OWNER"],
+    )
+    fake = FakeGitHub()
+    pr = sample_pr()
+    comment = pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]
+    comment["author"] = {"login": "repository-owner"}
+    comment["authorAssociation"] = "OWNER"
+    wire_fake_for_pr(fake, pr=pr)
+
+    result = inspect_work(cfg, client=fake)
+
+    assert len(result.signals) == 1
+    assert result.signals[0].trusted_author_login == "repository-owner"
+
+
 def test_sweep_prompt_injection_hold(tmp_path: Path):
     cfg = make_config(tmp_path)
     fake = FakeGitHub()

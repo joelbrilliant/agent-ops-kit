@@ -151,17 +151,24 @@ def test_load_config_roundtrip(tmp_path: Path):
     cfg = load_config(cfg_path)
     assert cfg.operator_logins == ["operator"]
     assert cfg.default_verification_commands["unit"] == ["true"]
-    assert cfg.policy_for("EXAMPLE-USER/REPO") is not None
-    assert cfg.policy_for("another-owner/another-repo").name == "*"
+    exact_policy = cfg.policy_for("EXAMPLE-USER/REPO")
+    fallback_policy = cfg.policy_for("another-owner/another-repo")
+    assert exact_policy is not None
+    assert fallback_policy is not None
+    assert exact_policy.name == "Example-User/Repo"
+    assert exact_policy.permitted_paths == ["src/*"]
+    assert fallback_policy.name == "*"
     assert cfg.trusted_reviewer_associations == ["OWNER", "MEMBER", "COLLABORATOR"]
 
     optional = json.loads(cfg_path.read_text(encoding="utf-8"))
     optional.pop("excluded_repositories")
     optional.pop("protected_path_patterns")
+    optional.pop("trusted_reviewer_associations")
     cfg_path.write_text(json.dumps(optional), encoding="utf-8")
     defaults = load_config(cfg_path)
     assert defaults.excluded_repositories == []
     assert "**/.env*" in defaults.protected_path_patterns
+    assert defaults.trusted_reviewer_associations == []
 
 
 @pytest.mark.parametrize(
@@ -180,7 +187,10 @@ def test_load_config_missing_required(tmp_path: Path):
         load_config(p)
 
 
-def test_load_config_rejects_untrusted_author_association(tmp_path: Path):
+@pytest.mark.parametrize("association", ["CONTRIBUTOR", "FIRST_TIMER", "UNKNOWN"])
+def test_load_config_rejects_untrusted_author_association(
+    tmp_path: Path, association: str
+):
     cfg_path = tmp_path / "cfg.json"
     cfg_path.write_text(
         json.dumps(
@@ -188,7 +198,7 @@ def test_load_config_rejects_untrusted_author_association(tmp_path: Path):
                 "operator_logins": ["operator"],
                 "owned_namespaces": ["operator"],
                 "trusted_reviewer_logins": ["reviewer"],
-                "trusted_reviewer_associations": ["CONTRIBUTOR"],
+                "trusted_reviewer_associations": [association],
                 "workspace_root": str(tmp_path / "w"),
                 "state_dir": str(tmp_path / "s"),
                 "classifier_command": ["echo", "{request_path}", "{response_path}"],

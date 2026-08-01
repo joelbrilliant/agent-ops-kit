@@ -166,17 +166,20 @@ def test_operator_reply_after_review_suppresses_repeat_action():
     assert any(skip.reason == "operator_replied_after_review" for skip in skips)
 
 
-def test_trusted_maintainer_association_is_actionable_without_named_login():
+@pytest.mark.parametrize("association", ["OWNER", "MEMBER", "COLLABORATOR"])
+def test_trusted_maintainer_association_is_actionable_without_named_login(
+    association: str,
+):
     pr = sample_pr()
     comment = pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]
     comment["author"] = {"login": "new-maintainer"}
-    comment["authorAssociation"] = "MEMBER"
+    comment["authorAssociation"] = association
 
     signals, skips = extract_signals_from_pr(
         pr,
         base_repository="operator/demo",
         trusted_reviewer_logins=[],
-        trusted_reviewer_associations=["MEMBER"],
+        trusted_reviewer_associations=[association],
         operator_logins=["operator"],
     )
 
@@ -196,6 +199,43 @@ def test_untrusted_author_association_remains_ignored():
         base_repository="operator/demo",
         trusted_reviewer_logins=[],
         trusted_reviewer_associations=["OWNER", "MEMBER", "COLLABORATOR"],
+        operator_logins=["operator"],
+    )
+
+    assert signals == []
+    assert any(skip.reason == "untrusted_author" for skip in skips)
+
+
+@pytest.mark.parametrize("association", ["CONTRIBUTOR", "FIRST_TIMER", "UNKNOWN"])
+def test_untrusted_author_association_cannot_be_enabled(association: str):
+    pr = sample_pr()
+    comment = pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]
+    comment["author"] = {"login": "outside-contributor"}
+    comment["authorAssociation"] = association
+
+    signals, skips = extract_signals_from_pr(
+        pr,
+        base_repository="operator/demo",
+        trusted_reviewer_logins=[],
+        trusted_reviewer_associations=[association],
+        operator_logins=["operator"],
+    )
+
+    assert signals == []
+    assert any(skip.reason == "untrusted_author" for skip in skips)
+
+
+def test_trusted_association_without_author_identity_remains_ignored():
+    pr = sample_pr()
+    comment = pr["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]
+    comment["author"] = None
+    comment["authorAssociation"] = "OWNER"
+
+    signals, skips = extract_signals_from_pr(
+        pr,
+        base_repository="operator/demo",
+        trusted_reviewer_logins=[],
+        trusted_reviewer_associations=["OWNER"],
         operator_logins=["operator"],
     )
 

@@ -15,6 +15,11 @@ class ConfigError(ValueError):
     """Invalid or missing configuration."""
 
 
+ALLOWED_TRUSTED_REVIEWER_ASSOCIATIONS = frozenset(
+    {"OWNER", "MEMBER", "COLLABORATOR"}
+)
+
+
 @dataclass(frozen=True)
 class RepoPolicy:
     name: str
@@ -62,7 +67,10 @@ class Config:
         return any(repo == ex.lower() for ex in self.excluded_repositories)
 
     def policy_for(self, repository: str) -> Optional[RepoPolicy]:
-        return self.repository_policies.get(repository.lower()) or self.repository_policies.get("*")
+        exact = self.repository_policies.get(repository.lower())
+        if exact is not None:
+            return exact
+        return self.repository_policies.get("*")
 
 
 def _require_str_list(data: Mapping[str, Any], key: str, *, allow_empty: bool = False) -> List[str]:
@@ -214,8 +222,9 @@ def load_config(path: Union[str, Path]) -> Config:
         if "trusted_reviewer_associations" in data
         else []
     )
-    allowed_associations = {"OWNER", "MEMBER", "COLLABORATOR"}
-    unsupported_associations = sorted(set(associations) - allowed_associations)
+    unsupported_associations = sorted(
+        set(associations) - ALLOWED_TRUSTED_REVIEWER_ASSOCIATIONS
+    )
     if unsupported_associations:
         raise ConfigError(
             "trusted_reviewer_associations contains unsupported values: "

@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import sys
+from pathlib import Path
 from typing import List, Optional
 
 from agent_ops import __version__
@@ -13,6 +14,7 @@ from agent_ops.audit.redaction import redact_text
 from agent_ops.audit.report import build_audit_report, render_audit_report
 from agent_ops.config import ConfigError, load_config
 from agent_ops.exit_codes import HELD, OK, USAGE_OR_TOOLING
+from agent_ops.qa.gate import run_gate
 
 
 def _print_json(data: object) -> None:
@@ -83,6 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_config(p_audit_report)
     p_audit_report.add_argument("--format", choices=("json", "markdown"), default="json")
 
+    qa = sub.add_parser("qa", help="Local isolated repository QA gate")
+    qa_sub = qa.add_subparsers(dest="qa_command", required=True)
+    p_qa_verify = qa_sub.add_parser("verify", help="Verify trusted named checks in a disposable clone")
+    add_config(p_qa_verify)
+    p_qa_verify.add_argument("--spec", required=True, help="QaGateSpecV1 JSON file")
+    p_qa_verify.add_argument("--repository", required=True, help="Local source repository path")
+
     return parser
 
 
@@ -90,7 +99,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command not in ("pr", "issue", "audit"):
+    if args.command not in ("pr", "issue", "audit", "qa"):
         parser.error("unknown command")
         return USAGE_OR_TOOLING
 
@@ -102,6 +111,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             sys.stderr.write(f"config error: {exc}\n")
         return USAGE_OR_TOOLING
+
+    if args.command == "qa":
+        outcome = run_gate(config, args.repository, Path(args.spec))
+        sys.stdout.write(outcome.render())
+        return outcome.exit_code
 
     if args.command == "audit":
         report = build_audit_report(config)

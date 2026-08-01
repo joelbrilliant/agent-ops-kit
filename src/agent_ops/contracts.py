@@ -214,7 +214,7 @@ class ActionReceiptV1:
 @dataclass
 class EvidenceBundleV1:
     run_id: str
-    schema_version: str
+    schema_version: int
     base_sha: str
     resulting_sha: str
     checks: List[CheckResultV1]

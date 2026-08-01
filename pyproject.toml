@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-watch"
+version = "0.1.0"
+description = "Small, stateful GitHub notification watch loop"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+github-watch = "github_watch.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+github_watch = ["templates/*.sb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]

@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  exit 64
+fi
+
+message=$1
+channel=${2:-}
+env_file=${BUZZ_ENV_FILE:-/Users/openclaw/.config/github-watch/buzz.env}
+
+if [ -r "$env_file" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      BUZZ_[A-Za-z0-9_]*) export "$key=$value" ;;
+    esac
+  done < "$env_file"
+fi
+
+if [ -z "$channel" ]; then
+  channel=${BUZZ_CHANNEL_UUID:-}
+fi
+if [ -z "$channel" ]; then
+  exit 64
+fi
+
+result=$(buzz messages send --channel "$channel" --content "$message")
+printf '%s' "$result" | python3 -c 'import json, sys; raise SystemExit(0 if json.load(sys.stdin).get("accepted") is True else 1)'

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -354,6 +355,74 @@ def test_required_checks_are_revalidated_immediately_before_push(tmp_path: Path)
     assert outcome.exit_code == 1
     assert calls["count"] == 2
     assert "required_checks_stale_before_push" in outcome.message
+    assert not fake.replies
+    assert _remote_ref(remote, ref) == original_sha
+
+
+def test_no_required_checks_is_valid_when_local_verification_passes(tmp_path: Path):
+    cfg = make_config(tmp_path)
+    fake = FakeGitHub()
+    _wire_real_remote(tmp_path, fake)
+    calls = {"count": 0}
+
+    def checks():
+        calls["count"] += 1
+        return []
+
+    fake.required_check_rows["operator/demo#1"] = checks
+
+    outcome = sweep(cfg, client=fake)
+
+    assert outcome.exit_code == 0, outcome.message
+    assert outcome.jobs_completed == 1
+    assert calls["count"] == 2
+    assert fake.replies
+
+
+def test_no_required_checks_still_requires_local_verification(tmp_path: Path):
+    cfg = make_config(
+        tmp_path,
+        default_verification_commands={
+            "unit": [sys.executable, "-c", "raise SystemExit(1)"]
+        },
+    )
+    fake = FakeGitHub()
+    _, remote, original_sha, ref = _wire_real_remote(tmp_path, fake)
+    fake.required_check_rows["operator/demo#1"] = []
+
+    outcome = sweep(cfg, client=fake)
+
+    assert outcome.exit_code == 1
+    assert "builder_verification_failed" in outcome.message
+    assert not fake.replies
+    assert _remote_ref(remote, ref) == original_sha
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected_reason"),
+    [
+        (
+            [{"bucket": "fail", "name": "required", "state": "FAILURE"}],
+            "required_checks_not_green_before_build",
+        ),
+        (
+            [{"bucket": "pass", "name": "", "state": "SUCCESS"}],
+            "required_check_contract_incomplete",
+        ),
+    ],
+)
+def test_failing_or_malformed_required_checks_fail_closed(
+    tmp_path: Path, rows: List[Dict[str, Any]], expected_reason: str
+):
+    cfg = make_config(tmp_path)
+    fake = FakeGitHub()
+    _, remote, original_sha, ref = _wire_real_remote(tmp_path, fake)
+    fake.required_check_rows["operator/demo#1"] = rows
+
+    outcome = sweep(cfg, client=fake)
+
+    assert outcome.exit_code == 1
+    assert expected_reason in outcome.message
     assert not fake.replies
     assert _remote_ref(remote, ref) == original_sha
 

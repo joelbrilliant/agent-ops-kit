@@ -180,13 +180,11 @@ def _required_check_snapshot(rows: Sequence[Dict[str, Any]]) -> Tuple[Tuple[str,
         if not name or not bucket or not state:
             raise RunnerContractError("required_check_contract_incomplete")
         snapshot.append((name, bucket, state))
-    if not snapshot:
-        raise RunnerContractError("required_check_evidence_missing")
     return tuple(sorted(snapshot))
 
 
 def _required_checks_green(snapshot: Sequence[Tuple[str, str, str]]) -> bool:
-    return bool(snapshot) and all(
+    return all(
         bucket == "pass" and state in {"SUCCESS", "PASS", "COMPLETED"}
         for _, bucket, state in snapshot
     )

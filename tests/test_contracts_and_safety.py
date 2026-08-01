@@ -109,8 +109,8 @@ def test_load_config_roundtrip(tmp_path: Path):
     cfg_path.write_text(
         json.dumps(
             {
-                "operator_logins": ["joel"],
-                "owned_namespaces": ["joelbrilliant"],
+                "operator_logins": ["operator"],
+                "owned_namespaces": ["example-user"],
                 "excluded_repositories": [],
                 "trusted_reviewer_logins": ["copilot"],
                 "workspace_root": str(tmp_path / "w"),
@@ -138,7 +138,7 @@ def test_load_config_roundtrip(tmp_path: Path):
         encoding="utf-8",
     )
     cfg = load_config(cfg_path)
-    assert cfg.operator_logins == ["joel"]
+    assert cfg.operator_logins == ["operator"]
     assert cfg.default_verification_commands["unit"] == ["true"]
 
     optional = json.loads(cfg_path.read_text(encoding="utf-8"))

@@ -145,23 +145,91 @@ def _branch_name(issue_cfg: IssueAutomationConfig, signal: IssueSignalV1) -> str
     return f"{issue_cfg.branch_prefix}-{signal.issue_number}-{short}"
 
 
+def _owned_namespaces(config: Config) -> set[str]:
+    owned = {login.lower() for login in config.operator_logins}
+    owned.update(namespace.lower() for namespace in config.owned_namespaces)
+    return owned
+
+
 def _can_push_repository(
-    client: GitHubClient, repository: str, operator_logins: Sequence[str]
+    client: GitHubClient,
+    repository: str,
+    operator_logins: Sequence[str],
+    owned_namespaces: Sequence[str] = (),
 ) -> bool:
     data = client.rest_get(f"/repos/{repository}")
     permissions = data.get("permissions") or {}
     push = bool(permissions.get("push") or permissions.get("maintain") or permissions.get("admin"))
     owner = str((data.get("owner") or {}).get("login") or "").lower()
     full_name = str(data.get("full_name") or repository).lower()
-    owner_ok = (not owner) or owner in {login.lower() for login in operator_logins}
-    # Also accept operator-owned namespaces via full_name prefix.
-    ns_ok = full_name.split("/", 1)[0] in {login.lower() for login in operator_logins}
+    allowed = {login.lower() for login in operator_logins}
+    allowed.update(namespace.lower() for namespace in owned_namespaces)
+    owner_ok = (not owner) or owner in allowed
+    ns_ok = full_name.split("/", 1)[0] in allowed
     return push and (owner_ok or ns_ok)
 
 
 def _repo_is_public(client: GitHubClient, repository: str) -> bool:
     data = client.rest_get(f"/repos/{repository}")
     return not bool(data.get("private"))
+
+
+def _assert_issue_last_safe_point(
+    config: Config,
+    issue_cfg: IssueAutomationConfig,
+    client: GitHubClient,
+    signal: IssueSignalV1,
+    *,
+    branch: str,
+    stale_reason: str,
+) -> IssueSignalV1:
+    """Re-prove AC-4 gates immediately before worktree create and before mutation."""
+    if config.exact_policy_for(signal.repository) is None:
+        raise RunnerContractError("missing_exact_repository_policy")
+    expected_base = issue_cfg.enabled_repositories.get(signal.repository)
+    if expected_base is None:
+        raise RunnerContractError("repository_not_enabled_for_issue_automation")
+    if expected_base != signal.base_ref:
+        raise RunnerContractError("issue_base_ref_policy_mismatch")
+
+    live, skip, meta = fetch_issue_snapshot(
+        client,
+        repository=signal.repository,
+        issue_number=signal.issue_number,
+        base_ref=signal.base_ref,
+        require_labels=issue_cfg.require_labels,
+        ignore_labels=issue_cfg.ignore_labels,
+    )
+    if skip is not None or live is None:
+        raise RunnerContractError(stale_reason)
+    if (
+        live.conversation_digest != signal.conversation_digest
+        or live.observed_base_sha != signal.observed_base_sha
+        or live.observed_updated_at != signal.observed_updated_at
+        or live.latest_comment_node_id != signal.latest_comment_node_id
+        or live.issue_node_id != signal.issue_node_id
+    ):
+        raise RunnerContractError(stale_reason)
+    if (
+        issue_cfg.require_labels
+        and not any(label in live.labels for label in issue_cfg.require_labels)
+    ):
+        raise RunnerContractError("label_removed_before_push")
+    if meta and meta.get("is_private") is True:
+        raise RunnerContractError("repository_not_public")
+    if not _repo_is_public(client, signal.repository):
+        raise RunnerContractError("repository_not_public")
+    if not _can_push_repository(
+        client,
+        signal.repository,
+        config.operator_logins,
+        owned_namespaces=sorted(_owned_namespaces(config)),
+    ):
+        raise RunnerContractError("repository_push_permission_missing")
+    existing = remote_ref_sha(config.git_command, signal.clone_url, branch)
+    if existing is not None:
+        raise RunnerContractError("target_branch_exists")
+    return live
 
 
 def _validate_bounds(
@@ -511,35 +579,15 @@ def run_claimed_issue_job(
         allowed_paths = _issue_allowed_paths(config, signal.repository, decision)
         verification_commands = _select_verifications(config, signal.repository, decision)
 
-        # Re-fetch before worktree
-        live, skip, meta = fetch_issue_snapshot(
+        # Re-fetch and re-prove AC-4 gates before worktree creation.
+        _assert_issue_last_safe_point(
+            config,
+            issue_cfg,
             client,
-            repository=signal.repository,
-            issue_number=signal.issue_number,
-            base_ref=signal.base_ref,
-            require_labels=issue_cfg.require_labels,
-            ignore_labels=issue_cfg.ignore_labels,
+            signal,
+            branch=branch,
+            stale_reason="issue_snapshot_stale_before_build",
         )
-        if skip is not None or live is None:
-            raise RunnerContractError("issue_snapshot_stale_before_build")
-        if (
-            live.conversation_digest != signal.conversation_digest
-            or live.observed_base_sha != signal.observed_base_sha
-            or live.observed_updated_at != signal.observed_updated_at
-            or live.latest_comment_node_id != signal.latest_comment_node_id
-        ):
-            raise RunnerContractError("issue_snapshot_stale_before_build")
-        if meta and meta.get("is_private") is True:
-            # Live canary requires public repo; private is HOLD for issue automation.
-            raise RunnerContractError("repository_not_public")
-        if not _can_push_repository(client, signal.repository, config.operator_logins):
-            raise RunnerContractError("repository_push_permission_missing")
-        if not _repo_is_public(client, signal.repository):
-            raise RunnerContractError("repository_not_public")
-
-        existing = remote_ref_sha(config.git_command, signal.clone_url, branch)
-        if existing is not None:
-            raise RunnerContractError("target_branch_exists")
 
         ledger.mark_phase(job_id, "preparing")
         worktree = create_worktree(
@@ -667,28 +715,16 @@ def run_claimed_issue_job(
             raise RunnerContractError("pr_copy_privacy_failure")
 
         ledger.mark_phase(job_id, "pre_push")
-        live, skip, _meta2 = fetch_issue_snapshot(
+        # Last safe point: re-prove policy, ownership, public visibility, pushability,
+        # open/label/digest/base SHA state, and absent target branch before mutation.
+        _assert_issue_last_safe_point(
+            config,
+            issue_cfg,
             client,
-            repository=signal.repository,
-            issue_number=signal.issue_number,
-            base_ref=signal.base_ref,
-            require_labels=issue_cfg.require_labels,
-            ignore_labels=issue_cfg.ignore_labels,
+            signal,
+            branch=branch,
+            stale_reason="issue_stale_before_push",
         )
-        if skip is not None or live is None:
-            raise RunnerContractError("issue_stale_before_push")
-        if (
-            live.conversation_digest != signal.conversation_digest
-            or live.observed_base_sha != signal.observed_base_sha
-            or live.observed_updated_at != signal.observed_updated_at
-            or live.latest_comment_node_id != signal.latest_comment_node_id
-        ):
-            raise RunnerContractError("issue_stale_before_push")
-        if not any(label in live.labels for label in issue_cfg.require_labels):
-            raise RunnerContractError("label_removed_before_push")
-        existing = remote_ref_sha(config.git_command, signal.clone_url, branch)
-        if existing is not None:
-            raise RunnerContractError("target_branch_exists")
 
         ledger.mark_phase(job_id, "pushing")
         mutation_started = True
@@ -718,6 +754,14 @@ def run_claimed_issue_job(
                 else reviewer.pr_body.rstrip() + f"\n\nCloses #{signal.issue_number}\n"
             ),
         )
+        create_mismatch = verify_draft_pr_readback(
+            created,
+            expected_base_ref=signal.base_ref,
+            expected_head_ref=branch,
+            expected_head_oid=resulting_sha,
+        )
+        if create_mismatch:
+            raise RunnerContractError(create_mismatch)
         readback = read_pull_request(
             client, repository=signal.repository, number=created.number
         )

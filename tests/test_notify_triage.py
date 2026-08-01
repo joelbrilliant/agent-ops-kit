@@ -8,6 +8,7 @@ from agent_ops.config import Config, NotificationTriagePolicy
 from agent_ops.github.client import FakeGitHub
 from agent_ops.maintenance.ledger import Ledger
 from agent_ops.maintenance.notify_triage import (
+    DECISION_ACTION_FIX,
     DECISION_NO_ACTION,
     DECISION_NEEDS_JOEL,
     inspect_notifications,
@@ -129,43 +130,22 @@ def test_validation_comment_is_no_action(tmp_path: Path) -> None:
     assert "val-1" in gh.marked_read
 
 
-def test_question_comment_needs_joel_and_notifies(tmp_path: Path) -> None:
-    ping_log = tmp_path / "ping.log"
+
+def test_question_comment_goes_to_oscar_not_joel_inbox(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
-    data = cfg.__dict__.copy()
-    data["notification_triage"] = NotificationTriagePolicy(
-        enabled=True,
-        needs_joel_command=[
-            "python3",
-            "-c",
-            (
-                "from pathlib import Path; import sys; "
-                "Path(sys.argv[1]).write_text(sys.argv[2]); print('ok')"
-            ),
-            str(ping_log),
-            "{message}",
-        ],
-        mark_read_on_needs_joel=True,
-    )
-    cfg = Config(**data)
     gh = FakeGitHub()
     gh.login = "operator"
     comment_path = "repos/operator/demo/issues/comments/100"
-    gh.notifications = [
-        {
-            "id": "q-1",
-            "reason": "comment",
-            "unread": True,
-            "updated_at": "2026-08-02T02:00:00Z",
-            "subject": {
-                "title": "fix: demo",
-                "type": "PullRequest",
-                "url": "https://api.github.com/repos/operator/demo/pulls/7",
-                "latest_comment_url": f"https://api.github.com/{comment_path}",
-            },
-            "repository": {"full_name": "operator/demo"},
-        }
-    ]
+    gh.notifications = [{
+        "id": "q-1", "reason": "comment", "unread": True,
+        "updated_at": "2026-08-02T02:00:00Z",
+        "subject": {
+            "title": "fix: demo", "type": "PullRequest",
+            "url": "https://api.github.com/repos/operator/demo/pulls/7",
+            "latest_comment_url": f"https://api.github.com/{comment_path}",
+        },
+        "repository": {"full_name": "operator/demo"},
+    }]
     gh.rest_handlers["repos/operator/demo/pulls/7"] = _open_pr_payload()
     gh.rest_handlers[comment_path] = {
         "user": {"login": "maintainer"},
@@ -174,35 +154,29 @@ def test_question_comment_needs_joel_and_notifies(tmp_path: Path) -> None:
         "html_url": "https://github.com/operator/demo/pull/7#issuecomment-2",
         "author_association": "MEMBER",
     }
-
     outcome = triage_notifications(cfg, client=gh, run_fix_sweep=False)
-    assert outcome.needs_joel == 1
-    assert outcome.notified_joel == 1
-    assert ping_log.exists()
-    body = ping_log.read_text()
-    assert "NEEDS_JOEL" in body or "option" in body.lower()
+    assert outcome.acted_fix == 1
+    assert outcome.needs_joel == 0
+    assert outcome.notified_joel == 0
+    assert outcome.items[0].decision.reason == "comment_asks_operator_question"
 
 
-def test_lgtm_with_question_still_needs_joel(tmp_path: Path) -> None:
+
+def test_lgtm_with_question_goes_to_oscar(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     gh = FakeGitHub()
     gh.login = "operator"
     comment_path = "repos/operator/demo/issues/comments/101"
-    gh.notifications = [
-        {
-            "id": "mixed-1",
-            "reason": "comment",
-            "unread": True,
-            "updated_at": "2026-08-02T02:30:00Z",
-            "subject": {
-                "title": "fix: demo",
-                "type": "PullRequest",
-                "url": "https://api.github.com/repos/operator/demo/pulls/7",
-                "latest_comment_url": f"https://api.github.com/{comment_path}",
-            },
-            "repository": {"full_name": "operator/demo"},
-        }
-    ]
+    gh.notifications = [{
+        "id": "mixed-1", "reason": "comment", "unread": True,
+        "updated_at": "2026-08-02T02:30:00Z",
+        "subject": {
+            "title": "fix: demo", "type": "PullRequest",
+            "url": "https://api.github.com/repos/operator/demo/pulls/7",
+            "latest_comment_url": f"https://api.github.com/{comment_path}",
+        },
+        "repository": {"full_name": "operator/demo"},
+    }]
     gh.rest_handlers["repos/operator/demo/pulls/7"] = _open_pr_payload()
     gh.rest_handlers[comment_path] = {
         "user": {"login": "maintainer"},
@@ -211,48 +185,39 @@ def test_lgtm_with_question_still_needs_joel(tmp_path: Path) -> None:
         "html_url": "https://github.com/operator/demo/pull/7#issuecomment-3",
         "author_association": "MEMBER",
     }
-
     outcome = triage_notifications(cfg, client=gh, run_fix_sweep=False)
-    assert outcome.needs_joel == 1
-    assert outcome.dismissed == 0
+    assert outcome.acted_fix == 1
+    assert outcome.needs_joel == 0
 
 
-def test_plain_issue_notification_needs_joel_not_silent_drop(tmp_path: Path) -> None:
+
+def test_plain_issue_notification_goes_to_oscar_not_silent_drop(tmp_path: Path) -> None:
     cfg = make_config(tmp_path)
     gh = FakeGitHub()
     gh.login = "operator"
-    gh.notifications = [
-        {
-            "id": "issue-1",
-            "reason": "mention",
-            "unread": True,
-            "updated_at": "2026-08-02T04:00:00Z",
-            "subject": {
-                "title": "Please decide on rollout",
-                "type": "Issue",
-                "url": "https://api.github.com/repos/operator/demo/issues/42",
-                "latest_comment_url": "",
-            },
-            "repository": {"full_name": "operator/demo"},
-        }
-    ]
-
+    gh.notifications = [{
+        "id": "issue-1", "reason": "mention", "unread": True,
+        "updated_at": "2026-08-02T04:00:00Z",
+        "subject": {
+            "title": "Please decide on rollout",
+            "type": "Issue",
+            "url": "https://api.github.com/repos/operator/demo/issues/42",
+            "latest_comment_url": "",
+        },
+        "repository": {"full_name": "operator/demo"},
+    }]
     def _gone(path: str = "repos/operator/demo/pulls/42") -> dict:
         from agent_ops.github.client import GitHubError
-
         raise GitHubError("HTTP 404: Not Found")
-
     gh.rest_handlers["repos/operator/demo/pulls/42"] = _gone
-
     outcome = triage_notifications(cfg, client=gh, run_fix_sweep=False)
-    assert outcome.needs_joel == 1
+    assert outcome.needs_joel == 0
     assert outcome.dismissed == 0
-    assert "issue-1" not in gh.marked_read
+    assert outcome.acted_fix == 1
     ledger = Ledger(cfg.state_dir / "ledger.sqlite3")
     row = ledger.get_notification("issue-1")
     assert row is not None
-    assert row["decision"] == DECISION_NEEDS_JOEL
-    assert row["reason"] == "issue_notification_needs_human_scan"
+    assert row["decision"] == DECISION_ACTION_FIX
 
 
 def test_inspect_only_does_not_mark_read(tmp_path: Path) -> None:
@@ -316,9 +281,9 @@ def test_needs_joel_command_rejects_embedded_message_placeholder(tmp_path: Path)
     assert "safe message" in log.read_text()
 
 
-def test_lgtm_with_fix_request_needs_joel(tmp_path: Path) -> None:
-    from agent_ops.maintenance.notify_triage import _comment_body_decision
 
+def test_lgtm_with_fix_request_goes_to_oscar(tmp_path: Path) -> None:
+    from agent_ops.maintenance.notify_triage import _comment_body_decision
     d = _comment_body_decision(
         "LGTM overall. Please fix the release note before merge.",
         repository="operator/demo",
@@ -326,7 +291,7 @@ def test_lgtm_with_fix_request_needs_joel(tmp_path: Path) -> None:
         url="https://github.com/operator/demo/pull/7",
     )
     assert d is not None
-    assert d.decision == "NEEDS_JOEL"
+    assert d.decision == DECISION_ACTION_FIX
     assert d.reason == "comment_requests_change"
 
 

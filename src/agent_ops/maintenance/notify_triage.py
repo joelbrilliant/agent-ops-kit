@@ -1,7 +1,8 @@
-"""GitHub notification front door: act, dismiss, or NEEDS_JOEL.
+"""GitHub notification front door: Oscar acts; Joel gets paper trail only.
 
-Automates Joel's paste-into-agent workflow for GitHub notifications on his
-contribution PRs. Untrusted notification and comment text is evidence only.
+Oscar owns the paste-workflow replacement. Joel is not the triage inbox.
+Buzz pings are only: (1) Hey Joel, Oscar did X, or (2) badly broken +
+what happened + proposed fix. Untrusted notification text is evidence only.
 """
 
 from __future__ import annotations
@@ -248,12 +249,9 @@ def _comment_body_decision(
     text = body or ""
     if _HOLD_RE.search(text):
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="comment_flags_hold_or_security",
-            joel_summary=(
-                f"NEEDS_JOEL: comment on {repository}#{pr_number} may need your call "
-                f"(hold/security/product). {url}"
-            ),
+            joel_summary="",
             mark_read=False,
             related_repository=repository,
             related_pr_number=pr_number,
@@ -261,11 +259,9 @@ def _comment_body_decision(
         )
     if _QUESTION_RE.search(text):
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="comment_asks_operator_question",
-            joel_summary=(
-                f"NEEDS_JOEL: question on {repository}#{pr_number} needs a human reply. {url}"
-            ),
+            joel_summary="",
             mark_read=False,
             related_repository=repository,
             related_pr_number=pr_number,
@@ -273,11 +269,9 @@ def _comment_body_decision(
         )
     if _ACTION_REQUEST_RE.search(text):
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="comment_requests_change",
-            joel_summary=(
-                f"NEEDS_JOEL: comment on {repository}#{pr_number} asks for a change. {url}"
-            ),
+            joel_summary="",
             mark_read=False,
             related_repository=repository,
             related_pr_number=pr_number,
@@ -299,12 +293,9 @@ def _comment_body_decision(
         remainder = re.sub(r"[\s\W_]+", " ", remainder).strip().lower()
         if remainder and len(remainder) > 8:
             return NotifyTriageDecisionV1(
-                decision=DECISION_NEEDS_JOEL,
+                decision=DECISION_ACTION_FIX,
                 reason="comment_mixed_ack_and_substance",
-                joel_summary=(
-                    f"NEEDS_JOEL: comment on {repository}#{pr_number} mixes ack with "
-                    f"other substance. {url}"
-                ),
+                joel_summary="",
                 mark_read=False,
                 related_repository=repository,
                 related_pr_number=pr_number,
@@ -470,12 +461,9 @@ def classify_notification(
             return decision
         url = note.subject_url or _public_url(repository, pr_number)
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="issue_notification_needs_human_scan",
-            joel_summary=(
-                f"NEEDS_JOEL: issue notification on {repo or repository or 'unknown'}: "
-                f"{title[:120]}. Not auto-actionable as a PR fix."
-            ),
+            joel_summary="",
             mark_read=False,
             related_repository=repo or repository,
             related_url=url,
@@ -484,24 +472,18 @@ def classify_notification(
     if subject_type == "issue":
         url = note.subject_url
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="issue_notification_needs_human_scan",
-            joel_summary=(
-                f"NEEDS_JOEL: issue notification on {repo or 'unknown'}: {title[:120]}. "
-                f"Not auto-actionable as a PR fix."
-            ),
+            joel_summary="",
             mark_read=False,
             related_repository=repo,
             related_url=url,
         )
 
     return NotifyTriageDecisionV1(
-        decision=DECISION_NEEDS_JOEL,
+        decision=DECISION_ACTION_FIX,
         reason="unclassified_notification",
-        joel_summary=(
-            f"NEEDS_JOEL: unclassified GitHub notification "
-            f"({subject_type or 'unknown'}) on {repo or 'unknown'}: {title[:120]}"
-        ),
+        joel_summary="",
         mark_read=False,
         related_repository=repo,
         related_url=note.subject_url,
@@ -641,9 +623,9 @@ def _classify_pr_notification(
                 related_pr_number=pr_number,
             )
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="pr_lookup_failed",
-            joel_summary=f"NEEDS_JOEL: could not load {repository}#{pr_number}: {exc}",
+            joel_summary="",
             mark_read=False,
             related_repository=repository,
             related_pr_number=pr_number,
@@ -669,12 +651,9 @@ def _classify_pr_notification(
         # Conservative: no auto-fix; escalate once if reason is review_requested/mention.
         if note.reason in {"review_requested", "mention", "assign", "author"}:
             return NotifyTriageDecisionV1(
-                decision=DECISION_NEEDS_JOEL,
+                decision=DECISION_ACTION_FIX,
                 reason="non_operator_author_needs_scan",
-                joel_summary=(
-                    f"NEEDS_JOEL: notification on {repository}#{pr_number} "
-                    f"(author {author or 'unknown'}), not auto-fixed. {html}"
-                ),
+                joel_summary="",
                 mark_read=False,
                 related_repository=repository,
                 related_pr_number=pr_number,
@@ -816,7 +795,7 @@ def _enqueue_agent_pr_work(
         job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return job_path
     prompt = (
-        "You are Oscar handling Joel's GitHub notification automatically "
+        "You are Oscar. You own this GitHub notification end-to-end. Joel is not the gate. Legacy: handling Joel's GitHub notification automatically "
         "(paste-workflow replacement). Joel must not be the gate.\n\n"
         f"Job file: {job_path}\n"
         f"PR: {repo}#{pr}\n"
@@ -960,28 +939,76 @@ def _record_and_maybe_mark(
     return "processed"
 
 
-def _notify_joel(config: Config, summary: str) -> bool:
+def _paper_trail(config: Config, summary: str) -> bool:
+    """Buzz paper trail only: Oscar done, or rare badly-broken + proposed fix."""
     command = list(config.notification_triage.needs_joel_command or [])
     if not command:
         return False
-    text = redact_text(summary, config.private_markers)
-    if not text.strip():
+    markers = getattr(config, "private_markers", None)
+    if markers is None:
+        markers = list(getattr(config, "private_material_patterns", []) or [])
+    try:
+        body = redact_text(summary, markers)  # type: ignore[arg-type]
+    except TypeError:
+        body = redact_text(summary, extra_patterns=list(markers))
+    body = (body or "").strip()
+    if not body:
         return False
-    # Safety: {message} may only appear as a whole argv token.
     argv: List[str] = []
     saw_placeholder = False
     for part in command:
         if part == "{message}":
-            argv.append(text)
+            argv.append(body)
             saw_placeholder = True
         elif "{message}" in part:
             return False
         else:
             argv.append(part)
     if not saw_placeholder:
-        argv = command + [text]
-    result = run_argv(argv, timeout=60, check=False)
-    return result.ok
+        argv = list(command) + [body]
+    try:
+        result = run_argv(argv, timeout=60, check=False)
+    except Exception:
+        return False
+    return bool(result.ok)
+
+
+def _notify_joel(config: Config, summary: str) -> bool:
+    """Back-compat alias for paper trail / tests."""
+    return _paper_trail(config, summary)
+
+
+def _notify_oscar_done(
+    config: Config,
+    *,
+    repository: str,
+    pr_number: int,
+    notes: str,
+    url: str = "",
+) -> bool:
+    msg = (
+        f"Hey Joel, Oscar handled {repository}#{int(pr_number)} for you. "
+        f"{(notes or '').strip()} {(url or '').strip()}"
+    ).strip()
+    return _paper_trail(config, msg)
+
+
+def _notify_badly_broken(
+    config: Config,
+    *,
+    repository: str,
+    pr_number: int,
+    what_happened: str,
+    proposed_fix: str,
+    url: str = "",
+) -> bool:
+    msg = (
+        f"Hey Joel, something is badly broken on {repository}#{int(pr_number)}. "
+        f"What happened: {(what_happened or '').strip()} "
+        f"Proposed fix: {(proposed_fix or '').strip()} {(url or '').strip()}"
+    ).strip()
+    return _paper_trail(config, msg)
+
 
 
 def inspect_notifications(
@@ -1109,13 +1136,10 @@ def triage_notifications(
         if decision.decision == DECISION_ACTION_FIX:
             acted += 1
             should_sweep = True
-            if decision.reason in {
-                "check_failing_on_current_open_pr",
-                "check_status_unknown",
-                "check_pr_lookup_failed",
-                "open_pr_activity_needs_scan",
-                "thread_discovery_failed",
-            }:
+            # Oscar owns all ACTION_FIX work. Joel is not the triage inbox.
+            if int(decision.related_pr_number or 0) > 0 and (
+                decision.related_repository or note.repository
+            ):
                 _enqueue_agent_pr_work(config, decision=decision, note=note)
             _record_and_maybe_mark(
                 ledger=ledger,
@@ -1128,7 +1152,7 @@ def triage_notifications(
 
         needs += 1
         summary = decision.joel_summary or (
-            f"NEEDS_JOEL: {note.repository} {note.subject_title[:120]}"
+            f"Hey Joel, something is badly broken on {note.repository}. What happened: {note.subject_title[:120]}. Proposed fix: Oscar hold pending diagnosis."
         )
         decision = NotifyTriageDecisionV1(
             decision=decision.decision,
@@ -1179,6 +1203,26 @@ def triage_notifications(
         sweep_triggered = True
         message = f"notify_triage_complete;sweep:{sweep_outcome.message}"
         exit_code = sweep_outcome.exit_code
+        if getattr(sweep_outcome, "jobs_completed", 0):
+            _paper_trail(
+                config,
+                (
+                    f"Hey Joel, Oscar completed {sweep_outcome.jobs_completed} "
+                    f"GitHub fix job(s) for you. {sweep_outcome.message}"
+                ),
+            )
+        elif getattr(sweep_outcome, "jobs_held", 0) and exit_code != OK:
+            _notify_badly_broken(
+                config,
+                repository="agent-ops",
+                pr_number=0,
+                what_happened=(
+                    f"Oscar held {sweep_outcome.jobs_held} job(s): {sweep_outcome.message}"
+                ),
+                proposed_fix=(
+                    "Inspect Agent Ops receipts and re-run after the hold cause is cleared."
+                ),
+            )
 
     return NotifyTriageOutcome(
         exit_code=exit_code,

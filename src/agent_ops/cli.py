@@ -13,17 +13,6 @@ from agent_ops.audit.redaction import redact_text
 from agent_ops.audit.report import build_audit_report, render_audit_report
 from agent_ops.config import ConfigError, load_config
 from agent_ops.exit_codes import HELD, OK, USAGE_OR_TOOLING
-from agent_ops.github.client import GitHubError
-from agent_ops.maintenance.issue_fix import inspect_issue_work, issue_sweep
-from agent_ops.maintenance.ledger import Ledger
-from agent_ops.maintenance.orchestrator import (
-    inspect_work,
-    is_paused,
-    set_paused,
-    status_report,
-    sweep,
-)
-from agent_ops.process import RunnerError
 
 
 def _print_json(data: object) -> None:
@@ -108,7 +97,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         config = load_config(args.config)
     except ConfigError as exc:
-        sys.stderr.write(f"config error: {exc}\n")
+        if args.command == "audit":
+            sys.stderr.write("config error: invalid audit configuration\n")
+        else:
+            sys.stderr.write(f"config error: {exc}\n")
         return USAGE_OR_TOOLING
 
     if args.command == "audit":
@@ -120,6 +112,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return OK if report.verdict == "PASS" else HELD
 
     if args.command == "issue":
+        from agent_ops.github.client import GitHubError
+        from agent_ops.maintenance.issue_fix import inspect_issue_work, issue_sweep
+        from agent_ops.maintenance.orchestrator import is_paused
+        from agent_ops.process import RunnerError
+
         if config.issue_automation is None:
             sys.stderr.write("config error: issue_automation is not configured\n")
             return USAGE_OR_TOOLING
@@ -166,6 +163,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             return outcome.exit_code
         parser.error("unknown issue subcommand")
         return USAGE_OR_TOOLING
+
+    from agent_ops.github.client import GitHubError
+    from agent_ops.maintenance.ledger import Ledger
+    from agent_ops.maintenance.orchestrator import (
+        inspect_work,
+        is_paused,
+        set_paused,
+        status_report,
+        sweep,
+    )
+    from agent_ops.process import RunnerError
 
     tool_err = _require_tools(config.gh_command, config.git_command)
     if tool_err and args.pr_command in ("sweep", "inspect"):

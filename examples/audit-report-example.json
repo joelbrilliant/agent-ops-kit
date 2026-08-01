@@ -55,7 +55,7 @@
   },
   "report_id": "sha256:8a00aa5816518b36fef0a5c607f3f431498524695c5de2465408f9e9741bdc43",
   "schema": "AuditReportV1",
-  "schema_version": "1",
+  "schema_version": 1,
   "summary": {
     "completed": 1,
     "held": 1,

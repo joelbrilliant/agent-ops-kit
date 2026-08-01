@@ -315,7 +315,7 @@ class AuditReportV1:
     """Portable, public-safe summary of validated local receipts."""
 
     schema: str
-    schema_version: str
+    schema_version: int
     report_id: str
     verdict: str
     summary: Dict[str, int]

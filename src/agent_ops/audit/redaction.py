@@ -13,8 +13,9 @@ _TOKEN_RE = re.compile(
     r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b"
 )
 _ABS_PATH_RE = re.compile(
-    r"(?P<p>/(?:Users|home|var|tmp|private|opt|Volumes|Applications|etc|usr|root)/[^\s\"']+|"
-    r"[A-Za-z]:\\(?:[^\\\s\"']+\\)*[^\\\s\"']+)"
+    r"(?P<p>(?<![A-Za-z0-9:/])/(?!/)[^\s\"']+|"
+    r"[A-Za-z]:\\(?:[^\\\s\"']+\\)*[^\\\s\"']+|"
+    r"\\\\(?:[^\\\s\"']+\\)+[^\\\s\"']+)"
 )
 
 

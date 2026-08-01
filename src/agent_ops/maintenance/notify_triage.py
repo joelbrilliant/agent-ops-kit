@@ -7,6 +7,10 @@ contribution PRs. Untrusted notification and comment text is evidence only.
 from __future__ import annotations
 
 import re
+import uuid
+import time
+import subprocess
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -528,14 +532,11 @@ def _classify_check_notification(
                 mark_read=True,
                 related_repository=repo,
             )
+        # Unmapped CI noise without a PR is not Joel's problem.
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_NO_ACTION,
             reason="check_notification_unmapped_branch",
-            joel_summary=(
-                f"NEEDS_JOEL: CI notification on {repo} could not be mapped to a branch/PR: "
-                f"{title[:140]}"
-            ),
-            mark_read=False,
+            mark_read=True,
             related_repository=repo,
         )
 
@@ -548,12 +549,9 @@ def _classify_check_notification(
         )
     except GitHubError:
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="check_pr_lookup_failed",
-            joel_summary=(
-                f"NEEDS_JOEL: CI notification on {repo} could not map branch {branch} "
-                f"to an open PR due to GitHub API failure."
-            ),
+            joel_summary="",
             mark_read=False,
             related_repository=repo,
         )
@@ -590,13 +588,12 @@ def _classify_check_notification(
 
     if failing:
         number, html = failing[0]
+        # Joel is not the CI gate. Hand to Oscar fix path.
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="check_failing_on_current_open_pr",
-            joel_summary=(
-                f"NEEDS_JOEL: checks still failing on open PR {repo}#{number}. {html}"
-            ),
-            mark_read=False,
+            joel_summary="",
+            mark_read=True,
             related_repository=repo,
             related_pr_number=number,
             related_url=html,
@@ -604,12 +601,10 @@ def _classify_check_notification(
     if unknown:
         number, html = unknown[0]
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="check_status_unknown",
-            joel_summary=(
-                f"NEEDS_JOEL: could not determine check status for open PR {repo}#{number}. {html}"
-            ),
-            mark_read=False,
+            joel_summary="",
+            mark_read=True,
             related_repository=repo,
             related_pr_number=number,
             related_url=html,
@@ -748,12 +743,11 @@ def _classify_pr_notification(
         )
 
     if discovery_failed:
+        # Transient API issues are Oscar/retry work, not Joel's inbox.
         return NotifyTriageDecisionV1(
-            decision=DECISION_NEEDS_JOEL,
+            decision=DECISION_ACTION_FIX,
             reason="thread_discovery_failed",
-            joel_summary=(
-                f"NEEDS_JOEL: could not load review threads for {repository}#{pr_number}. {html}"
-            ),
+            joel_summary="",
             mark_read=False,
             related_repository=repository,
             related_pr_number=pr_number,
@@ -771,19 +765,102 @@ def _classify_pr_notification(
             related_url=html,
         )
 
-    # Default: rare unknown activity on Joel's open PR → exception inbox.
+    # Default: agent owns open-PR activity (paste-workflow equivalent). Joel is not the gate.
     return NotifyTriageDecisionV1(
-        decision=DECISION_NEEDS_JOEL,
+        decision=DECISION_ACTION_FIX,
         reason="open_pr_activity_needs_scan",
-        joel_summary=(
-            f"NEEDS_JOEL: activity on open PR {repository}#{pr_number} "
-            f"({note.reason or 'unknown reason'}; {note.subject_title[:80]}). {html}"
-        ),
-        mark_read=False,
+        joel_summary="",
+        mark_read=True,
         related_repository=repository,
         related_pr_number=pr_number,
         related_url=html,
     )
+
+
+
+def _agent_job_dir(config: Config) -> Path:
+    path = config.state_dir / "notify_agent_jobs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _enqueue_agent_pr_work(
+    config: Config,
+    *,
+    decision: NotifyTriageDecisionV1,
+    note: NotifyRow,
+) -> Optional[Path]:
+    """Queue Oscar-owned work for CI/open-PR activity. Joel is not the gate."""
+    repo = (decision.related_repository or note.repository or "").strip()
+    pr = int(decision.related_pr_number or 0)
+    if not repo or pr <= 0:
+        return None
+    job_id = f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+    job_path = _agent_job_dir(config) / f"{job_id}.json"
+    job = {
+        "job_id": job_id,
+        "created_at": time.time(),
+        "reason": decision.reason,
+        "repository": repo,
+        "pr_number": pr,
+        "url": decision.related_url or _public_url(repo, pr),
+        "notification_thread_id": note.thread_id,
+        "subject_title": note.subject_title,
+        "notification_reason": note.reason,
+        "status": "queued",
+    }
+    job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    launcher = Path("/Users/openclaw/.hermes/profiles/oscar/bin/agent-ops-hermes")
+    if not launcher.is_file():
+        job["status"] = "queued_no_launcher"
+        job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return job_path
+    prompt = (
+        "You are Oscar handling Joel's GitHub notification automatically "
+        "(paste-workflow replacement). Joel must not be the gate.\n\n"
+        f"Job file: {job_path}\n"
+        f"PR: {repo}#{pr}\n"
+        f"URL: {job['url']}\n"
+        f"Notify reason: {decision.reason}\n"
+        f"Subject: {note.subject_title}\n\n"
+        "Inspect the PR. If noise/already resolved: set job status=no_action. "
+        "If fixable: minimal fix on the PR branch, verify what you can, normal push only. "
+        "No merge, no force-push. If true product/security hold only: status=hold. "
+        "Update the job JSON file. Reply with one JSON object "
+        '{"status":"fixed|no_action|hold|failed","sha":"","notes":""}.'
+    )
+    log_path = _agent_job_dir(config) / f"{job_id}.log"
+    try:
+        with log_path.open("w", encoding="utf-8") as logf:
+            proc = subprocess.Popen(
+                [
+                    str(launcher),
+                    "chat",
+                    "-q",
+                    prompt,
+                    "-Q",
+                    "--max-turns",
+                    "24",
+                    "--provider",
+                    "openai-codex",
+                    "--model",
+                    "gpt-5.6-sol",
+                    "-w",
+                    str(config.workspace_root),
+                ],
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        job["status"] = "dispatched"
+        job["pid"] = proc.pid
+        job["log_path"] = str(log_path)
+        job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except OSError as exc:
+        job["status"] = "dispatch_failed"
+        job["error"] = str(exc)[:200]
+        job_path.write_text(json.dumps(job, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return job_path
 
 
 def collect_notifications(
@@ -1032,6 +1109,14 @@ def triage_notifications(
         if decision.decision == DECISION_ACTION_FIX:
             acted += 1
             should_sweep = True
+            if decision.reason in {
+                "check_failing_on_current_open_pr",
+                "check_status_unknown",
+                "check_pr_lookup_failed",
+                "open_pr_activity_needs_scan",
+                "thread_discovery_failed",
+            }:
+                _enqueue_agent_pr_work(config, decision=decision, note=note)
             _record_and_maybe_mark(
                 ledger=ledger,
                 github=github,

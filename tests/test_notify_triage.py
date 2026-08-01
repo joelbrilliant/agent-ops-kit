@@ -370,7 +370,9 @@ def test_empty_required_checks_falls_back_to_all_checks(tmp_path: Path) -> None:
         {"bucket": "fail", "name": "unit", "state": "FAILURE"}
     ]
     out = triage_notifications(cfg, client=gh, run_fix_sweep=False)
-    assert out.needs_joel == 1
+    assert out.acted_fix == 1
+    assert out.needs_joel == 0
+    assert out.items[0].decision.decision == "ACTION_FIX"
     assert out.items[0].decision.reason == "check_failing_on_current_open_pr"
 
 

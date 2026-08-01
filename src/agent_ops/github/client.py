@@ -116,6 +116,31 @@ class GhClient:
                 raise GitHubError("required checks query failed")
         return [dict(row) for row in rows]
 
+    def all_checks(self, repository: str, pr_number: int) -> List[Dict[str, Any]]:
+        result = run_argv(
+            [
+                self.gh_command,
+                "pr",
+                "checks",
+                str(pr_number),
+                "--repo",
+                repository,
+                "--json",
+                "bucket,name,state",
+            ],
+            timeout=120,
+            check=False,
+        )
+        try:
+            rows = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise GitHubError("all checks returned invalid shape") from exc
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise GitHubError("all checks returned invalid shape")
+        if not result.ok and not rows:
+            raise GitHubError("all checks query failed")
+        return [dict(row) for row in rows]
+
     def list_notifications(
         self,
         *,
@@ -140,6 +165,25 @@ class GhClient:
 
     def mark_notification_read(self, thread_id: str) -> None:
         result = run_argv(
+
+    def get_notification_thread(self, thread_id: str) -> Dict[str, Any]:
+        result = run_argv(
+            [
+                self.gh_command,
+                "api",
+                f"notifications/threads/{thread_id}",
+            ],
+            timeout=60,
+            check=False,
+        )
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise GitHubError("notification thread returned invalid JSON") from exc
+        if not result.ok or not isinstance(payload, dict):
+            raise GitHubError(f"get notification thread failed: {thread_id}")
+        return dict(payload)
+
             [
                 self.gh_command,
                 "api",
@@ -169,6 +213,7 @@ class FakeGitHub:
         self.replies: List[Dict[str, Any]] = []
         self.mutations: List[Dict[str, Any]] = []
         self.required_check_rows: Dict[str, Any] = {}
+        self.all_check_rows: Dict[str, Any] = {}
         self.notifications: List[Dict[str, Any]] = []
         self.marked_read: List[str] = []
 
@@ -226,6 +271,14 @@ class FakeGitHub:
         rows = value() if callable(value) else value
         return [dict(row) for row in rows]
 
+    def all_checks(self, repository: str, pr_number: int) -> List[Dict[str, Any]]:
+        key = f"{repository.lower()}#{pr_number}"
+        value = getattr(self, "all_check_rows", {}).get(key)
+        if value is None:
+            value = self.required_check_rows.get(key, [])
+        rows = value() if callable(value) else value
+        return [dict(row) for row in rows]
+
     def list_notifications(
         self,
         *,
@@ -238,4 +291,22 @@ class FakeGitHub:
         return [dict(item) for item in self.notifications]
 
     def mark_notification_read(self, thread_id: str) -> None:
+        if getattr(self, "mark_read_error", None):
+            err = self.mark_read_error
+            if callable(err):
+                err = err(thread_id)
+            if isinstance(err, Exception):
+                raise err
+            raise GitHubError(str(err or "mark failed"))
         self.marked_read.append(str(thread_id))
+
+    def get_notification_thread(self, thread_id: str) -> Dict[str, Any]:
+        threads = getattr(self, "notification_threads", {}) or {}
+        if thread_id in threads:
+            value = threads[thread_id]
+            return dict(value() if callable(value) else value)
+        for row in self.notifications:
+            if str(row.get("id") or "") == str(thread_id):
+                return dict(row)
+        raise GitHubError(f"notification thread not found: {thread_id}")
+

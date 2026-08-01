@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-ops-kit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Evidence-gated operations for local AI agent stacks"
 readme = "README.md"
 license = { text = "MIT" }

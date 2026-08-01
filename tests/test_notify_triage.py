@@ -314,3 +314,105 @@ def test_needs_joel_command_rejects_embedded_message_placeholder(tmp_path: Path)
     cfg_ok = Config(**data_ok)
     assert _notify_joel(cfg_ok, "safe message") is True
     assert "safe message" in log.read_text()
+
+
+def test_lgtm_with_fix_request_needs_joel(tmp_path: Path) -> None:
+    from agent_ops.maintenance.notify_triage import _comment_body_decision
+
+    d = _comment_body_decision(
+        "LGTM overall. Please fix the release note before merge.",
+        repository="operator/demo",
+        pr_number=7,
+        url="https://github.com/operator/demo/pull/7",
+    )
+    assert d is not None
+    assert d.decision == "NEEDS_JOEL"
+    assert d.reason == "comment_requests_change"
+
+
+def test_empty_required_checks_falls_back_to_all_checks(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    gh = FakeGitHub()
+    gh.login = "operator"
+    gh.notifications = [
+        {
+            "id": "ci-empty-req",
+            "reason": "ci_activity",
+            "unread": True,
+            "updated_at": "2026-08-02T04:00:00Z",
+            "subject": {
+                "title": "CI workflow run failed for feat/x branch",
+                "type": "CheckSuite",
+                "url": "",
+            },
+            "repository": {"full_name": "operator/demo"},
+        }
+    ]
+    gh.search_pages = {
+        "is:pr is:open repo:operator/demo head:feat/x": [
+            [
+                {
+                    "number": 9,
+                    "html_url": "https://github.com/operator/demo/pull/9",
+                    "user": {"login": "operator"},
+                }
+            ]
+        ]
+    }
+    gh.rest_handlers["repos/operator/demo/pulls/9"] = {
+        **_open_pr_payload(),
+        "number": 9,
+        "html_url": "https://github.com/operator/demo/pull/9",
+        "head": {"ref": "feat/x", "sha": "b" * 40},
+    }
+    gh.required_check_rows["operator/demo#9"] = []
+    gh.all_check_rows["operator/demo#9"] = [
+        {"bucket": "fail", "name": "unit", "state": "FAILURE"}
+    ]
+    out = triage_notifications(cfg, client=gh, run_fix_sweep=False)
+    assert out.needs_joel == 1
+    assert out.items[0].decision.reason == "check_failing_on_current_open_pr"
+
+
+def test_mark_read_failure_stays_pending_mark(tmp_path: Path) -> None:
+    cfg = make_config(tmp_path)
+    gh = FakeGitHub()
+    gh.login = "operator"
+
+    def boom(_thread_id: str) -> None:
+        raise Exception("nope")
+
+    # Patch mark to raise GitHubError-compatible via wrapping
+    from agent_ops.github.client import GitHubError
+
+    def fail_mark(thread_id: str) -> None:
+        raise GitHubError("mark failed")
+
+    gh.mark_notification_read = fail_mark  # type: ignore[method-assign]
+    gh.notifications = [
+        {
+            "id": "mk-1",
+            "reason": "state_change",
+            "unread": True,
+            "updated_at": "2026-08-02T05:00:00Z",
+            "subject": {
+                "title": "fix: demo",
+                "type": "PullRequest",
+                "url": "https://api.github.com/repos/operator/demo/pulls/7",
+                "latest_comment_url": "",
+            },
+            "repository": {"full_name": "operator/demo"},
+        }
+    ]
+    gh.rest_handlers["repos/operator/demo/pulls/7"] = {
+        **_open_pr_payload(),
+        "state": "closed",
+        "merged": True,
+    }
+    out = triage_notifications(cfg, client=gh, run_fix_sweep=False)
+    assert out.dismissed == 1
+    ledger = Ledger(cfg.state_dir / "ledger.sqlite3")
+    row = ledger.get_notification("mk-1")
+    assert row is not None
+    assert row["status"] == "pending_mark"
+    assert row["decision"] == DECISION_NO_ACTION

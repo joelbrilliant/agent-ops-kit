@@ -45,6 +45,15 @@ _VALIDATION_ONLY_RE = re.compile(
     r"acknowledged|ack\b"
     r")\b"
 )
+_ACTION_REQUEST_RE = re.compile(
+    r"(?is)\b("
+    r"please\s+(?:fix|change|update|add|remove|revert|address)|"
+    r"needs?\s+(?:a\s+)?(?:fix|change|update)|"
+    r"before\s+merge|must\s+(?:fix|change)|"
+    r"can you (?:fix|change|update)|could you (?:fix|change|update)|"
+    r"blocking|blocker|follow[- ]?up required"
+    r")\b"
+)
 _QUESTION_RE = re.compile(
     r"(?is)(\?|\b(?:could you|can you|please (?:clarify|confirm|decide)|"
     r"what do you think|should we|do you want|which option)\b)"
@@ -227,6 +236,11 @@ def _comment_body_decision(
     pr_number: int,
     url: str,
 ) -> Optional[NotifyTriageDecisionV1]:
+    """Classify top-level PR comment bodies.
+
+    Validation/ack is only NO_ACTION when the body does not also request work.
+    "LGTM overall. Please fix the release note before merge." must not dismiss.
+    """
     text = body or ""
     if _HOLD_RE.search(text):
         return NotifyTriageDecisionV1(
@@ -241,7 +255,6 @@ def _comment_body_decision(
             related_pr_number=pr_number,
             related_url=url,
         )
-    # Questions win over pure-validation matches. "LGTM - which option?" must not dismiss.
     if _QUESTION_RE.search(text):
         return NotifyTriageDecisionV1(
             decision=DECISION_NEEDS_JOEL,
@@ -254,7 +267,45 @@ def _comment_body_decision(
             related_pr_number=pr_number,
             related_url=url,
         )
+    if _ACTION_REQUEST_RE.search(text):
+        return NotifyTriageDecisionV1(
+            decision=DECISION_NEEDS_JOEL,
+            reason="comment_requests_change",
+            joel_summary=(
+                f"NEEDS_JOEL: comment on {repository}#{pr_number} asks for a change. {url}"
+            ),
+            mark_read=False,
+            related_repository=repository,
+            related_pr_number=pr_number,
+            related_url=url,
+        )
     if _VALIDATION_ONLY_RE.search(text):
+        # Strip validation tokens and common non-action framing; leftover work language fails closed.
+        remainder = _VALIDATION_ONLY_RE.sub(" ", text)
+        remainder = re.sub(
+            r"(?is)\b("
+            r"independent\s+validation|validation|from\s+me|on\s+(?:this|the)\s+(?:pr|change)|"
+            r"on\s+[0-9a-f]{7,40}|commit\s+[0-9a-f]{7,40}|sha\s*[0-9a-f]{7,40}|"
+            r"earlier\s+concern\s+is\s+resolved|resolved|fixed\s+in|"
+            r"overall|here|for\s+now|nice|great|solid|good\s+work"
+            r")\b",
+            " ",
+            remainder,
+        )
+        remainder = re.sub(r"[\s\W_]+", " ", remainder).strip().lower()
+        if remainder and len(remainder) > 8:
+            return NotifyTriageDecisionV1(
+                decision=DECISION_NEEDS_JOEL,
+                reason="comment_mixed_ack_and_substance",
+                joel_summary=(
+                    f"NEEDS_JOEL: comment on {repository}#{pr_number} mixes ack with "
+                    f"other substance. {url}"
+                ),
+                mark_read=False,
+                related_repository=repository,
+                related_pr_number=pr_number,
+                related_url=url,
+            )
         return NotifyTriageDecisionV1(
             decision=DECISION_NO_ACTION,
             reason="validation_or_ack_only",
@@ -296,10 +347,12 @@ def _find_open_prs_for_branch(
     owner, name = repository.split("/", 1)
     # Prefer search: open PRs in repo with head branch.
     query = f"is:pr is:open repo:{repository} head:{branch}"
+    search_failed = False
     try:
         page = client.rest_search_issues(query, page=1, per_page=20)
     except GitHubError:
         page = {"items": []}
+        search_failed = True
     items = page.get("items") if isinstance(page, dict) else []
     out: List[Dict[str, Any]] = []
     for item in items or []:
@@ -320,7 +373,6 @@ def _find_open_prs_for_branch(
                 continue
         user = (pr.get("user") or {}).get("login") or ""
         if operator_logins and not _is_operator_pr(str(user), operator_logins):
-            # Still include owned-namespace PRs opened by others only if author empty
             # Front door focuses on operator contribution PRs.
             continue
         out.append(pr)
@@ -329,7 +381,9 @@ def _find_open_prs_for_branch(
     # Fallback: list open PRs in repo (small repos / API shape issues).
     try:
         data = _rest_json(client, f"repos/{owner}/{name}/pulls?state=open&per_page=30")
-    except GitHubError:
+    except GitHubError as exc:
+        if search_failed:
+            raise GitHubError(f"pr_lookup_failed:{exc}") from exc
         return []
     if not isinstance(data, list):
         return []
@@ -348,8 +402,9 @@ def _find_open_prs_for_branch(
 
 
 def _checks_all_green(rows: Sequence[Dict[str, Any]]) -> bool:
+    # Empty set is unknown, not green. Callers must choose a fallback path.
     if not rows:
-        return True
+        return False
     for row in rows:
         bucket = str(row.get("bucket") or "").lower()
         state = str(row.get("state") or "").upper()
@@ -484,12 +539,24 @@ def _classify_check_notification(
             related_repository=repo,
         )
 
-    prs = _find_open_prs_for_branch(
-        client,
-        repository=repo,
-        branch=branch,
-        operator_logins=config.operator_logins,
-    )
+    try:
+        prs = _find_open_prs_for_branch(
+            client,
+            repository=repo,
+            branch=branch,
+            operator_logins=config.operator_logins,
+        )
+    except GitHubError:
+        return NotifyTriageDecisionV1(
+            decision=DECISION_NEEDS_JOEL,
+            reason="check_pr_lookup_failed",
+            joel_summary=(
+                f"NEEDS_JOEL: CI notification on {repo} could not map branch {branch} "
+                f"to an open PR due to GitHub API failure."
+            ),
+            mark_read=False,
+            related_repository=repo,
+        )
     if not prs:
         return NotifyTriageDecisionV1(
             decision=DECISION_NO_ACTION,
@@ -498,13 +565,22 @@ def _classify_check_notification(
             related_repository=repo,
         )
 
-    # Evaluate each matching open PR's required checks on current head.
+    # Evaluate each matching open PR's checks on current head.
+    # Prefer required checks; if none are configured, fall back to all current checks.
     failing: List[Tuple[int, str]] = []
+    unknown: List[Tuple[int, str]] = []
     for pr in prs:
         number = int(pr.get("number") or 0)
         html = str(pr.get("html_url") or _public_url(repo, number))
         try:
             rows = client.required_checks(repo, number)
+            if not rows:
+                getter = getattr(client, "all_checks", None)
+                if callable(getter):
+                    rows = getter(repo, number)
+                if not rows:
+                    unknown.append((number, html))
+                    continue
         except GitHubError:
             failing.append((number, html))
             continue
@@ -512,28 +588,39 @@ def _classify_check_notification(
             continue
         failing.append((number, html))
 
-    if not failing:
+    if failing:
+        number, html = failing[0]
         return NotifyTriageDecisionV1(
-            decision=DECISION_NO_ACTION,
-            reason="check_failure_superseded_or_current_green",
-            mark_read=True,
+            decision=DECISION_NEEDS_JOEL,
+            reason="check_failing_on_current_open_pr",
+            joel_summary=(
+                f"NEEDS_JOEL: checks still failing on open PR {repo}#{number}. {html}"
+            ),
+            mark_read=False,
             related_repository=repo,
-            related_pr_number=int(prs[0].get("number") or 0),
-            related_url=str(prs[0].get("html_url") or _public_url(repo, int(prs[0].get("number") or 0))),
+            related_pr_number=number,
+            related_url=html,
         )
-
-    # Current open operator PR still red: not silent. Front door does not invent CI repairs.
-    number, html = failing[0]
+    if unknown:
+        number, html = unknown[0]
+        return NotifyTriageDecisionV1(
+            decision=DECISION_NEEDS_JOEL,
+            reason="check_status_unknown",
+            joel_summary=(
+                f"NEEDS_JOEL: could not determine check status for open PR {repo}#{number}. {html}"
+            ),
+            mark_read=False,
+            related_repository=repo,
+            related_pr_number=number,
+            related_url=html,
+        )
     return NotifyTriageDecisionV1(
-        decision=DECISION_NEEDS_JOEL,
-        reason="check_failing_on_current_open_pr",
-        joel_summary=(
-            f"NEEDS_JOEL: required checks still failing on open PR {repo}#{number}. {html}"
-        ),
-        mark_read=False,
+        decision=DECISION_NO_ACTION,
+        reason="check_failure_superseded_or_current_green",
+        mark_read=True,
         related_repository=repo,
-        related_pr_number=number,
-        related_url=html,
+        related_pr_number=int(prs[0].get("number") or 0),
+        related_url=str(prs[0].get("html_url") or _public_url(repo, int(prs[0].get("number") or 0))),
     )
 
 
@@ -610,11 +697,13 @@ def _classify_pr_notification(
     # Slice-1 path: trusted unresolved review threads on current head.
     signals = []
     skips = []
+    discovery_failed = False
     try:
         signals, skips, _pr = _signals_for_pr(client, config, repository, pr_number)
     except GitHubError:
-        # Discovery can fail in degraded environments; still try top-level comment triage.
+        # Discovery can fail; do not invent "no signal". Prefer comment triage, else NEEDS_JOEL.
         signals, skips = [], []
+        discovery_failed = True
 
     if signals:
         return NotifyTriageDecisionV1(
@@ -658,6 +747,19 @@ def _classify_pr_notification(
             related_url=html,
         )
 
+    if discovery_failed:
+        return NotifyTriageDecisionV1(
+            decision=DECISION_NEEDS_JOEL,
+            reason="thread_discovery_failed",
+            joel_summary=(
+                f"NEEDS_JOEL: could not load review threads for {repository}#{pr_number}. {html}"
+            ),
+            mark_read=False,
+            related_repository=repository,
+            related_pr_number=pr_number,
+            related_url=html,
+        )
+
     # Review requested with nothing actionable yet.
     if note.reason in {"review_requested", "subscribed", "manual", "state_change"}:
         return NotifyTriageDecisionV1(
@@ -689,14 +791,17 @@ def collect_notifications(
     config: Config,
     *,
     include_read: bool = False,
+    ledger: Optional[Ledger] = None,
 ) -> List[NotifyRow]:
+    """Collect unread notifications, preferring unprocessed ones for the per-run cap."""
     policy = config.notification_triage
     per_page = 50
     max_items = max(1, policy.max_per_run)
     rows: List[NotifyRow] = []
     seen: Set[str] = set()
     page = 1
-    while len(rows) < max_items:
+    max_pages = 20
+    while len(rows) < max_items and page <= max_pages:
         batch = client.list_notifications(
             all_notifications=include_read or policy.include_read,
             participating=policy.participating_only,
@@ -710,15 +815,72 @@ def collect_notifications(
             if note is None or note.thread_id in seen:
                 continue
             seen.add(note.thread_id)
+            if ledger is not None:
+                prior = ledger.get_notification(note.thread_id)
+                if (
+                    prior
+                    and prior.get("updated_at") == note.updated_at
+                    and prior.get("status") == "processed"
+                ):
+                    continue
             rows.append(note)
             if len(rows) >= max_items:
                 break
         if len(batch) < per_page:
             break
         page += 1
-        if page > 10:
-            break
     return rows
+
+
+def _record_and_maybe_mark(
+    *,
+    ledger: Ledger,
+    github: GitHubClient,
+    note: NotifyRow,
+    decision: NotifyTriageDecisionV1,
+    want_mark: bool,
+) -> str:
+    """Record decision. Only mark processed after successful mark when requested."""
+    if not want_mark or not decision.mark_read:
+        ledger.record_notification(
+            thread_id=note.thread_id,
+            decision=decision.decision,
+            reason=decision.reason,
+            updated_at=note.updated_at,
+            repository=decision.related_repository or note.repository,
+            pr_number=decision.related_pr_number,
+            related_url=decision.related_url,
+            joel_summary=decision.joel_summary or "",
+            status="processed",
+        )
+        return "processed"
+    try:
+        github.mark_notification_read(note.thread_id)
+    except GitHubError:
+        ledger.record_notification(
+            thread_id=note.thread_id,
+            decision=decision.decision,
+            reason=decision.reason,
+            updated_at=note.updated_at,
+            repository=decision.related_repository or note.repository,
+            pr_number=decision.related_pr_number,
+            related_url=decision.related_url,
+            joel_summary=decision.joel_summary or "",
+            status="pending_mark",
+        )
+        return "pending_mark"
+    ledger.record_notification(
+        thread_id=note.thread_id,
+        decision=decision.decision,
+        reason=decision.reason,
+        updated_at=note.updated_at,
+        repository=decision.related_repository or note.repository,
+        pr_number=decision.related_pr_number,
+        related_url=decision.related_url,
+        joel_summary=decision.joel_summary or "",
+        status="processed",
+    )
+    return "processed"
 
 
 def _notify_joel(config: Config, summary: str) -> bool:
@@ -728,8 +890,7 @@ def _notify_joel(config: Config, summary: str) -> bool:
     text = redact_text(summary, config.private_markers)
     if not text.strip():
         return False
-    # Safety: {message} may only appear as a whole argv token. Never interpolate into
-    # a larger string (blocks sh -c "…{message}…" injection from untrusted titles).
+    # Safety: {message} may only appear as a whole argv token.
     argv: List[str] = []
     saw_placeholder = False
     for part in command:
@@ -753,7 +914,7 @@ def inspect_notifications(
     ensure_state_dirs(config)
     github = client or GhClient(config.gh_command)
     ledger = Ledger(config.state_dir / "ledger.sqlite3")
-    notes = collect_notifications(github, config, include_read=False)
+    notes = collect_notifications(github, config, include_read=False, ledger=ledger)
     items: List[NotifyTriageItem] = []
     for note in notes:
         prior = ledger.get_notification(note.thread_id)
@@ -800,7 +961,6 @@ def triage_notifications(
     ledger = Ledger(config.state_dir / "ledger.sqlite3")
 
     if is_paused(config):
-        # Still classify for operator visibility, but do not mutate or ping.
         outcome = inspect_notifications(config, client=github)
         outcome.message = "paused_notify_inspect_only"
         return outcome
@@ -811,7 +971,7 @@ def triage_notifications(
         outcome.exit_code = HELD
         return outcome
 
-    notes = collect_notifications(github, config, include_read=False)
+    notes = collect_notifications(github, config, include_read=False, ledger=ledger)
     items: List[NotifyTriageItem] = []
     acted = 0
     dismissed = 0
@@ -834,32 +994,78 @@ def triage_notifications(
             )
             continue
 
+        if (
+            prior
+            and prior.get("updated_at") == note.updated_at
+            and prior.get("status") == "pending_mark"
+            and prior.get("decision") in {DECISION_NO_ACTION, DECISION_ACTION_FIX, DECISION_NEEDS_JOEL}
+        ):
+            decision = NotifyTriageDecisionV1.from_dict(prior)
+            if decision.decision == DECISION_NO_ACTION:
+                want = config.notification_triage.mark_read_on_no_action
+            elif decision.decision == DECISION_ACTION_FIX:
+                want = config.notification_triage.mark_read_on_action
+            else:
+                want = config.notification_triage.mark_read_on_needs_joel
+            _record_and_maybe_mark(
+                ledger=ledger, github=github, note=note, decision=decision, want_mark=want
+            )
+            items.append(
+                NotifyTriageItem(notification=note, decision=decision, already_processed=True)
+            )
+            continue
+
         decision = classify_notification(github, config, note)
         items.append(NotifyTriageItem(notification=note, decision=decision))
 
         if decision.decision == DECISION_NO_ACTION:
             dismissed += 1
-            ledger.record_notification(
-                thread_id=note.thread_id,
-                decision=decision.decision,
-                reason=decision.reason,
-                updated_at=note.updated_at,
-                repository=decision.related_repository or note.repository,
-                pr_number=decision.related_pr_number,
-                related_url=decision.related_url,
-                joel_summary="",
-                status="processed",
+            _record_and_maybe_mark(
+                ledger=ledger,
+                github=github,
+                note=note,
+                decision=decision,
+                want_mark=config.notification_triage.mark_read_on_no_action,
             )
-            if decision.mark_read and config.notification_triage.mark_read_on_no_action:
-                try:
-                    github.mark_notification_read(note.thread_id)
-                except GitHubError:
-                    pass
             continue
 
         if decision.decision == DECISION_ACTION_FIX:
             acted += 1
             should_sweep = True
+            _record_and_maybe_mark(
+                ledger=ledger,
+                github=github,
+                note=note,
+                decision=decision,
+                want_mark=config.notification_triage.mark_read_on_action,
+            )
+            continue
+
+        needs += 1
+        summary = decision.joel_summary or (
+            f"NEEDS_JOEL: {note.repository} {note.subject_title[:120]}"
+        )
+        decision = NotifyTriageDecisionV1(
+            decision=decision.decision,
+            reason=decision.reason,
+            joel_summary=summary,
+            mark_read=decision.mark_read,
+            related_repository=decision.related_repository,
+            related_pr_number=decision.related_pr_number,
+            related_url=decision.related_url,
+        )
+        coalesce_key = (
+            f"{(decision.related_repository or note.repository).lower()}#"
+            f"{int(decision.related_pr_number or 0)}"
+        )
+        if coalesce_key in notified_keys:
+            pinged = True
+        else:
+            pinged = _notify_joel(config, summary)
+            if pinged:
+                notified += 1
+                notified_keys.add(coalesce_key)
+        if not pinged and config.notification_triage.needs_joel_command:
             ledger.record_notification(
                 thread_id=note.thread_id,
                 decision=decision.decision,
@@ -868,51 +1074,17 @@ def triage_notifications(
                 repository=decision.related_repository or note.repository,
                 pr_number=decision.related_pr_number,
                 related_url=decision.related_url,
-                joel_summary="",
-                status="processed",
+                joel_summary=summary,
+                status="pending_notify",
             )
-            if decision.mark_read and config.notification_triage.mark_read_on_action:
-                try:
-                    github.mark_notification_read(note.thread_id)
-                except GitHubError:
-                    pass
             continue
-
-        # NEEDS_JOEL - coalesce pings per PR within one run.
-        needs += 1
-        summary = decision.joel_summary or (
-            f"NEEDS_JOEL: {note.repository} {note.subject_title[:120]}"
+        _record_and_maybe_mark(
+            ledger=ledger,
+            github=github,
+            note=note,
+            decision=decision,
+            want_mark=config.notification_triage.mark_read_on_needs_joel,
         )
-        coalesce_key = (
-            f"{(decision.related_repository or note.repository).lower()}#"
-            f"{int(decision.related_pr_number or 0)}|{decision.reason}"
-        )
-        pinged = False
-        if coalesce_key not in notified_keys:
-            pinged = _notify_joel(config, summary)
-            if pinged:
-                notified += 1
-                notified_keys.add(coalesce_key)
-        else:
-            # Already pinged this PR/reason this run; treat as processed silently.
-            pinged = True
-        ledger.record_notification(
-            thread_id=note.thread_id,
-            decision=decision.decision,
-            reason=decision.reason,
-            updated_at=note.updated_at,
-            repository=decision.related_repository or note.repository,
-            pr_number=decision.related_pr_number,
-            related_url=decision.related_url,
-            joel_summary=summary,
-            status="processed" if pinged or not config.notification_triage.needs_joel_command else "pending_notify",
-        )
-        if pinged or not config.notification_triage.needs_joel_command:
-            if config.notification_triage.mark_read_on_needs_joel:
-                try:
-                    github.mark_notification_read(note.thread_id)
-                except GitHubError:
-                    pass
 
     sweep_triggered = False
     message = "notify_triage_complete"

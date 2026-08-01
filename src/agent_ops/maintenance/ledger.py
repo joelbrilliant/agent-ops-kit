@@ -555,3 +555,34 @@ class Ledger:
                     now,
                 ),
             )
+
+    def has_needs_joel_for_pr(
+        self,
+        repository: str,
+        pr_number: int,
+        *,
+        exclude_thread_id: str = "",
+    ) -> bool:
+        """True if a durable NEEDS_JOEL was already recorded for this PR.
+
+        Used to coalesce pings across runs (Frank BLOCK #6).
+        """
+        repo = (repository or "").lower()
+        pr = int(pr_number or 0)
+        if not repo or not pr:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT thread_id FROM notifications
+                WHERE lower(COALESCE(repository, '')) = ?
+                  AND pr_number = ?
+                  AND decision = 'NEEDS_JOEL'
+                  AND status IN ('processed', 'pending_notify')
+                  AND (? = '' OR thread_id != ?)
+                LIMIT 1
+                """,
+                (repo, pr, exclude_thread_id or "", exclude_thread_id or ""),
+            ).fetchone()
+            return row is not None
+

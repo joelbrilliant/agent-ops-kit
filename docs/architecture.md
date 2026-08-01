@@ -17,23 +17,23 @@ Public surface for Agent Ops Kit PR maintenance and issue-to-draft automation.
 ## Issue-to-draft flow (slice 3)
 
 1. `issue inspect` / `issue sweep` discovers open labelled issues in explicitly enabled repositories with exact repository policies.
-2. `IssueSignalV1` stores digests, labels, author, observed `updated_at`, base branch tip SHA, and clone URL. Raw title/body/comments stay memory-only.
+2. The portable `IssueSignalV1` surface stores repository and issue identity, title/body/conversation digests, observed timestamp, latest comment node ID, configured base ref and observed base SHA. Raw title/body/comments remain untrusted and appear only in owner-only runner request files.
 3. Classification uses a sticky build-profile session before any worktree exists. HOLD writes a receipt and stops.
-4. ROUTINE creates a new branch from the observed default-branch tip, runs the sticky builder, verifies, then a distinct fresh review-profile session may fix in-bounds and produce draft PR copy plus the issue reply draft.
+4. ROUTINE creates a new branch from the observed configured base-ref tip, runs the sticky builder, verifies, then a distinct fresh review-profile session may fix in-bounds and produce draft PR copy plus the issue reply draft.
 5. Bounds include path policy, protected paths, `max_paths_per_issue`, `max_changed_files`, and `max_diff_lines`.
-6. Immediately before push the orchestrator revalidates open state, conversation digests, base tip SHA, push permission, public repository, and absent target branch.
+6. Immediately before push the orchestrator revalidates the exact repository and path/check policy, operator ownership, public visibility, push permission, open state, trigger labels, conversation digest, base tip SHA, clean bounded reviewer SHA, and absent target branch.
 7. Non-force push, draft PR create (`draft=true`, body includes `Closes #N`), and issue comment all require exact readback. No merge, ready-for-review, label mutation, or issue close.
-8. Claim key is repository + issue number + observed `updated_at` + base tip SHA. Issue and PR loops share the global active-job lock, pause file, and circuit breaker.
+8. Claim key is repository + issue number + conversation digest + base tip SHA. A completed issue is terminal even if a later comment changes the digest, preventing duplicate draft PRs. Held pre-mutation conversations may be reconsidered only when their digest changes. Issue and PR loops share the global active-job lock, pause file, and circuit breaker.
 
 ## Session and capability boundary
 
 Each job has exactly two fresh sessions. Classification and build are one sticky session. Review-fix is the second distinct session. The external runners return strict response schemas with exact route, freshness, session, and SHA attestations. The orchestrator rejects missing or extra fields.
 
-Oscar gets no orchestrator GitHub credential capability. Runner processes receive an allowlisted environment, isolated `HOME` and `GH_CONFIG_DIR`, disabled Git credential helpers, and no inherited GitHub token variables. The orchestrator separately proves its own GitHub identity and that `gh auth status` fails in the runner environment before launching Oscar.
+Runner processes do not inherit orchestrator GitHub credentials through their environment or Git configuration. Build and review profiles receive separate allowlisted environments, isolated `HOME` and `GH_CONFIG_DIR`, disabled Git credential helpers, and no inherited GitHub or messaging credential variables. The orchestrator separately proves its own GitHub identity and proves that `gh auth status` fails in each environment before and after its runner boundary.
 
 ## Sweep semantics
 
-Search covers every configured operator login and owned namespace with fail-closed REST pagination. Review-thread and per-thread comment connections are independently paginated. A sweep processes eligible claims serially. Pause and open-circuit states still inspect for operator visibility but do not claim work, launch runners, create worktrees, push, or reply. Disabled issue automation still allows inspect and never claims.
+Search covers every configured operator login and owned namespace with fail-closed REST pagination. Review-thread and per-thread comment connections are independently paginated. A sweep processes eligible claims serially. Pause and open-circuit states do not claim work, launch runners, create worktrees, push, or reply; the explicit inspect command remains available for operator visibility. Disabled issue automation still allows inspect and never claims.
 
 ## Modules
 
@@ -50,3 +50,5 @@ Search covers every configured operator login and owned namespace with fail-clos
 ## Non-goals
 
 No email, webhooks, auto-merge, deploy, memory kit, or private harness paths in the public core. Issue automation does not merge, close issues, mutate labels, force-push, or change repository settings.
+
+Slice 3 is not a general-autonomy claim. Portable evidence must be followed by the frozen packet's live canary sequence before operators enable issue automation.

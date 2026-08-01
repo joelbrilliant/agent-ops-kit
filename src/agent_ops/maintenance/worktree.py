@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 from pathlib import Path
@@ -17,7 +18,19 @@ _SAFE_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def _git(git_cmd: str, args: Sequence[str], *, cwd: Optional[Path] = None, check: bool = True) -> ProcResult:
-    return run_argv([git_cmd, *args], cwd=cwd, check=check, timeout=600)
+    return run_argv(
+        [
+            git_cmd,
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.fsmonitor=false",
+            *args,
+        ],
+        cwd=cwd,
+        check=check,
+        timeout=600,
+    )
 
 
 def repo_slug_dir(repository: str) -> str:
@@ -175,11 +188,20 @@ def remote_ref_sha(
     )
     if not result.ok:
         raise RunnerError("unable to read head repository ref")
-    lines = [line for line in result.stdout.splitlines() if line.strip()]
-    if len(lines) != 1:
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
         return None
-    sha = lines[0].split()[0]
-    return sha if _SAFE_SHA.fullmatch(sha) else None
+    if len(lines) != 1:
+        raise RunnerError("remote_ref_ambiguous")
+    parts = lines[0].split()
+    expected_ref = f"refs/heads/{head_ref}"
+    if (
+        len(parts) != 2
+        or parts[1] != expected_ref
+        or not _SAFE_SHA.fullmatch(parts[0].lower())
+    ):
+        raise RunnerError("remote_ref_malformed")
+    return parts[0].lower()
 
 
 def remove_worktree(
@@ -205,8 +227,45 @@ def changed_files(git_cmd: str, worktree: Path, base_sha: str) -> List[str]:
 
 
 def diff_text(git_cmd: str, worktree: Path, base_sha: str) -> str:
-    r = _git(git_cmd, ["-C", str(worktree), "diff", f"{base_sha}..HEAD"], check=True)
+    r = _git(
+        git_cmd,
+        [
+            "-C",
+            str(worktree),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            f"{base_sha}..HEAD",
+        ],
+        check=True,
+    )
     return r.stdout
+
+
+def commit_messages(git_cmd: str, worktree: Path, base_sha: str) -> str:
+    result = _git(
+        git_cmd,
+        ["-C", str(worktree), "log", "--format=%B", f"{base_sha}..HEAD"],
+        check=True,
+    )
+    return result.stdout
+
+
+def local_config_fingerprint(git_cmd: str, worktree: Path) -> Tuple[str, ...]:
+    result = _git(
+        git_cmd,
+        ["-C", str(worktree), "config", "--local", "--null", "--list"],
+        check=True,
+    )
+    records = []
+    for record in result.stdout.split("\x00"):
+        if not record:
+            continue
+        key = record.split("\n", 1)[0].lower()
+        if key in {"user.name", "user.email"}:
+            continue
+        records.append(record)
+    return tuple(sorted(records))
 
 
 def commit_if_needed(git_cmd: str, worktree: Path, message: str) -> Optional[str]:
@@ -246,7 +305,14 @@ def push_head_no_force(
     # Explicit non-force push of HEAD to refs/heads/<head_ref>
     return _git(
         git_cmd,
-        ["-C", str(worktree), "push", "pushorigin", f"HEAD:refs/heads/{head_ref}"],
+        [
+            "-C",
+            str(worktree),
+            "push",
+            "--no-verify",
+            "pushorigin",
+            f"HEAD:refs/heads/{head_ref}",
+        ],
         check=False,
     )
 

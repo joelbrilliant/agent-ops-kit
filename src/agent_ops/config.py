@@ -182,7 +182,10 @@ def _environment_allowlist(raw: Any) -> List[str]:
     if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
         raise ConfigError("capability_isolation.environment_allowlist must be an array of strings")
     names = [item.strip() for item in raw if item.strip()]
-    secret_name = re.compile(r"(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH|API_KEY|PRIVATE_KEY)")
+    secret_name = re.compile(
+        r"(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH|API_KEY|PRIVATE_KEY|"
+        r"WEBHOOK|SLACK|DISCORD|TELEGRAM|TWILIO|SMTP)"
+    )
     isolation_name = re.compile(r"^(?:HOME|HERMES_HOME|GH_CONFIG_DIR|XDG_CONFIG_HOME|GIT_CONFIG.*)$")
     denied = sorted(
         name
@@ -201,6 +204,18 @@ def _environment_allowlist(raw: Any) -> List[str]:
 
 _SAFE_BRANCH_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _is_safe_git_ref(ref: str) -> bool:
+    if not ref or ref in {"@", "."}:
+        return False
+    if ref.startswith(("-", ".", "/")) or ref.endswith(("/", ".")):
+        return False
+    if "//" in ref or ".." in ref or "@{" in ref:
+        return False
+    if any(part.startswith(".") or part.endswith(".lock") for part in ref.split("/")):
+        return False
+    return not any(ord(char) < 32 or char in " ~^:?*[\\" for char in ref)
 
 
 def _parse_issue_command(
@@ -232,7 +247,6 @@ def _parse_issue_automation(raw: Any) -> IssueAutomationConfig:
     allowed = {
         "enabled",
         "enabled_repositories",
-        "repositories",
         "require_labels",
         "ignore_labels",
         "trigger_label",
@@ -257,12 +271,6 @@ def _parse_issue_automation(raw: Any) -> IssueAutomationConfig:
     enabled = bool(raw["enabled"])
 
     enabled_raw = raw.get("enabled_repositories")
-    if enabled_raw is None and isinstance(raw.get("repositories"), list):
-        # Packet shape: repositories allowlist; default branch resolved at runtime.
-        repos_list = raw.get("repositories") or []
-        if not all(isinstance(item, str) for item in repos_list):
-            raise ConfigError("issue_automation.repositories must be an array of strings")
-        enabled_raw = {str(item): "main" for item in repos_list}
     if not isinstance(enabled_raw, dict) or not enabled_raw:
         raise ConfigError(
             "issue_automation.enabled_repositories must be a non-empty object of owner/name -> base branch"
@@ -274,12 +282,16 @@ def _parse_issue_automation(raw: Any) -> IssueAutomationConfig:
                 "issue_automation.enabled_repositories keys and values must be strings"
             )
         repo_key = repo.strip()
-        base_ref = base.strip().strip("/")
+        base_ref = base.strip()
         if not _SAFE_REPO_RE.fullmatch(repo_key) or ".." in repo_key:
             raise ConfigError(
                 f"issue_automation.enabled_repositories key is not exact owner/name: {repo}"
             )
-        if not base_ref or not _SAFE_BRANCH_PREFIX_RE.match(base_ref) or ".." in base_ref:
+        if (
+            base_ref.startswith("refs/")
+            or not _SAFE_BRANCH_PREFIX_RE.fullmatch(base_ref)
+            or not _is_safe_git_ref(base_ref)
+        ):
             raise ConfigError(
                 f"issue_automation.enabled_repositories base branch is unsafe for {repo_key}"
             )
@@ -288,14 +300,18 @@ def _parse_issue_automation(raw: Any) -> IssueAutomationConfig:
             raise ConfigError(f"duplicate enabled repository: {repo_key}")
         enabled_repositories[repo_key] = base_ref
 
+    if "require_labels" in raw and "trigger_label" in raw:
+        raise ConfigError(
+            "issue_automation must use trigger_label or require_labels, not both"
+        )
     require_labels: List[str] = []
     if "require_labels" in raw:
         value = raw.get("require_labels")
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ConfigError("issue_automation.require_labels must be an array of strings")
         require_labels = [item.strip() for item in value if str(item).strip()]
-    elif "trigger_label" in raw:
-        trigger_label = str(raw.get("trigger_label", "")).strip()
+    else:
+        trigger_label = str(raw.get("trigger_label", "agent-ops:ready")).strip()
         if trigger_label:
             require_labels = [trigger_label]
     if not require_labels:
@@ -314,10 +330,10 @@ def _parse_issue_automation(raw: Any) -> IssueAutomationConfig:
             if any(ch in label for ch in ("\n", "\r", "\x00")):
                 raise ConfigError("issue_automation.ignore_labels contains a control character")
 
-    branch_prefix = str(raw.get("branch_prefix", "agent-ops/issue")).strip().strip("/")
-    if not branch_prefix or not _SAFE_BRANCH_PREFIX_RE.match(branch_prefix):
+    branch_prefix = str(raw.get("branch_prefix", "agent-ops/issue")).strip()
+    if not branch_prefix or not _SAFE_BRANCH_PREFIX_RE.fullmatch(branch_prefix):
         raise ConfigError("issue_automation.branch_prefix is unsafe or missing")
-    if ".." in branch_prefix or branch_prefix.startswith("-") or branch_prefix.endswith(".lock"):
+    if not _is_safe_git_ref(f"{branch_prefix}-1-deadbeef"):
         raise ConfigError("issue_automation.branch_prefix is unsafe")
 
     title_tpl = str(raw.get("draft_pr_title_template", "agent-ops: issue #{issue_number}")).strip()
@@ -372,9 +388,9 @@ def _parse_issue_automation(raw: Any) -> IssueAutomationConfig:
         raw.get("review_runner_identity"),
         label="issue_automation.review_runner_identity",
     )
-    if build_identity == review_identity:
+    if build_identity.profile == review_identity.profile:
         raise ConfigError(
-            "issue_automation.build_runner_identity and review_runner_identity must be distinct"
+            "issue_automation build and review profiles must be distinct"
         )
 
     return IssueAutomationConfig(
@@ -610,13 +626,12 @@ def ensure_state_dirs(config: Config) -> None:
     receipts = config.state_dir / "receipts"
     requests.mkdir(parents=True, exist_ok=True)
     receipts.mkdir(parents=True, exist_ok=True)
-    # Best-effort owner-only permissions on state dir (posix).
-    try:
-        os.chmod(config.state_dir, stat.S_IRWXU)
-        os.chmod(requests, stat.S_IRWXU)
-        os.chmod(receipts, stat.S_IRWXU)
-    except OSError:
-        pass
+    if any(path.is_symlink() for path in (config.state_dir, requests, receipts)):
+        raise ConfigError("state and request directories must not be symlinks")
+    for path in (config.state_dir, requests, receipts):
+        os.chmod(path, stat.S_IRWXU)
+        if stat.S_IMODE(path.stat().st_mode) != stat.S_IRWXU:
+            raise ConfigError(f"owner-only state directory mode not enforced: {path.name}")
 
 
 def expand_runner_argv(

@@ -69,11 +69,11 @@
     }
   },
   "issue_automation": {
-    "enabled": true,
+    "enabled": false,
     "enabled_repositories": {
       "YOUR_GITHUB_LOGIN/YOUR_REPOSITORY": "main"
     },
-    "require_labels": ["agent-ops:ready"],
+    "trigger_label": "agent-ops:ready",
     "ignore_labels": [],
     "branch_prefix": "agent-ops/issue",
     "draft_pr_title_template": "agent-ops: issue #{issue_number}",

@@ -26,6 +26,7 @@ mutation($repositoryId: ID!, $baseRefName: String!, $headRefName: String!, $titl
       baseRefName
       headRefName
       headRefOid
+      state
     }
   }
 }
@@ -67,6 +68,7 @@ class DraftPullRequest:
     base_ref: str
     head_ref: str
     head_oid: str
+    state: str
 
 
 def _owner_name(repository: str) -> tuple[str, str]:
@@ -119,6 +121,7 @@ def create_draft_pull_request(
         base_ref=str(pr.get("baseRefName") or ""),
         head_ref=str(pr.get("headRefName") or ""),
         head_oid=str(pr.get("headRefOid") or ""),
+        state=str(pr.get("state") or ""),
     )
 
 
@@ -146,6 +149,7 @@ def read_pull_request(
         base_ref=str(pr.get("baseRefName") or ""),
         head_ref=str(pr.get("headRefName") or ""),
         head_oid=str(pr.get("headRefOid") or ""),
+        state=str(pr.get("state") or ""),
     )
 
 
@@ -156,6 +160,8 @@ def verify_draft_pr_readback(
     expected_head_ref: str,
     expected_head_oid: str,
 ) -> Optional[str]:
+    if pr.state != "OPEN":
+        return "pr_not_open"
     if not pr.is_draft:
         return "pr_not_draft"
     if pr.base_ref != expected_base_ref:

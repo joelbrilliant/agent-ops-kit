@@ -34,6 +34,8 @@ Exit codes: `0` no work or completed work, `1` held job or open circuit, `2` inv
 
 When `issue_automation` is enabled in config, a maintainer label (default `agent-ops:ready`) authorises evaluation of one open issue in an explicitly listed repository. The tool classifies before any worktree exists, builds a bounded routine fix on a new non-force branch, runs a fresh review-profile fixer, opens a verified draft PR, and posts a Joel-voice reply on the originating issue. Raw issue text never enters argv, branch names, or receipts. A second sweep must launch no model and perform no duplicate write.
 
+Slice 3 remains canary-only. Synthetic and portable checks do not establish live GitHub readiness. Keep issue automation disabled until the prescribed live canaries pass under operator observation.
+
 ### Configuration
 
 Local JSON only (gitignored). See `docs/configuration.md` and `config.example.json`.
@@ -47,13 +49,13 @@ A three-hour Hermes cron example is in `docs/cron-hermes.md`.
 - Untrusted GitHub text is written only to owner-only request files or stdin.
 - Runner commands are argv arrays with fixed placeholders only.
 - Subprocess calls always use `shell=False`.
-- Oscar runner environments inherit no GitHub credentials, operator home, or messaging capability.
+- Runner environments inherit no GitHub credentials, operator home, or messaging credentials.
 - Classifier and builder share one session. Reviewer-fixer uses a second fresh session.
 - Strict runner schemas attest exact route, session identity, candidate SHA, resulting SHA, and reply voice gate.
 - One active job at a time with atomic deduplication, interruption recovery, and a global circuit breaker.
-- Paused and circuit-open sweeps inspect only.
+- Paused and circuit-open sweeps perform no mutations and launch no runners; use the explicit inspect command for visibility.
 - Thread, head SHA, head repository permission, required checks, remote ref, clean worktree, and history are revalidated immediately before mutation.
-- Pushes target the attested head repository and existing head ref without force.
+- PR fixes target the attested head repository and existing head ref without force; issue fixes create one controlled non-force branch.
 - No merge, deploy, repository-setting change, force push, or automatic thread resolution.
 
 ### Tests

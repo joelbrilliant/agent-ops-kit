@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -49,19 +51,32 @@ def _write_receipt_payload(
 ) -> Path:
     receipts_dir = state_dir / "receipts"
     receipts_dir.mkdir(parents=True, exist_ok=True)
+    if receipts_dir.is_symlink() or receipts_dir.resolve().parent != state_dir.resolve():
+        raise ValueError("receipt directory escaped state directory")
     path = receipts_dir / f"{name_stem}.json"
     text = dumps_json(payload)
     text = redact_text(text, private_markers)
     findings = assert_no_private_material(text, private_markers)
     if findings:
         raise ValueError("receipt privacy validation failed:" + ",".join(findings))
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(text, encoding="utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=str(receipts_dir), prefix=f".{name_stem}-", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
     try:
-        temporary.chmod(0o600)
-    except OSError:
-        pass
-    temporary.replace(path)
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
     return path
 
 

@@ -130,11 +130,16 @@ class FakeGitHub:
 
     def rest_search_issues(self, query: str, page: int = 1, per_page: int = 100) -> Dict[str, Any]:
         pages: List[List[Dict[str, Any]]] = self.search_pages.get(query, [])
+        unique_keys = {
+            str(item.get("node_id") or item.get("id") or f"{page_index}:{item_index}")
+            for page_index, search_page in enumerate(pages)
+            for item_index, item in enumerate(search_page)
+        }
+        total = len(unique_keys)
         # Exact key only - avoid cross-query contamination between author/user searches
         if page < 1 or page > len(pages):
-            return {"total_count": 0, "incomplete_results": False, "items": []}
+            return {"total_count": total, "incomplete_results": False, "items": []}
         items = pages[page - 1]
-        total = sum(len(p) for p in pages)
         return {"total_count": total, "incomplete_results": False, "items": items}
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

@@ -728,7 +728,7 @@ def test_issue_config_requires_distinct_attested_build_and_review_runners(tmp_pa
         load_config(path)
 
 
-def test_issue_task_uses_config_paths_not_issue_requested_paths(tmp_path: Path):
+def test_issue_path_policy_helper_rejects_classifier_expansion(tmp_path: Path):
     # Covered by happy path using policy paths while classifier requests empty;
     # also unit-level via _issue_allowed_paths behaviour on expansion hold.
     from agent_ops.contracts import DecisionV1
@@ -879,7 +879,7 @@ def test_issue_job_holds_when_label_removed_before_push(tmp_path: Path):
     assert not fake.created_pulls
 
 
-def test_issue_job_never_force_pushes(tmp_path: Path):
+def test_push_head_no_force_source_has_no_force_flags(tmp_path: Path):
     # push_head_no_force never passes --force; unit-level regression via source.
     from agent_ops.maintenance import worktree as wt_mod
     import inspect
@@ -895,9 +895,9 @@ def test_issue_receipt_contains_no_raw_issue_or_private_path(tmp_path: Path):
     head_repo, sha = init_base_repo(git_root)
     bare = make_bare_remote(git_root, head_repo)
     fake = FakeGitHub()
-    issue = sample_issue(body="Please set broken=0. See PRIVATE_PATH_MARKER never.")
-    # Body must not hold for injection markers
-    issue["body"] = "Please set broken=0 in demo.txt"
+    issue = sample_issue(
+        body="Please set broken=0 in demo.txt. PRIVATE_PATH_MARKER is untrusted."
+    )
     wire_fake_for_issue(fake, issue=issue, base_sha=sha, clone_url=str(bare))
 
     handlers = list(fake.graphql_handlers)
@@ -964,7 +964,7 @@ def test_pr_and_issue_jobs_share_one_global_active_lock(tmp_path: Path):
     assert job2 is None
 
 
-def test_issue_runner_cannot_authenticate_to_github(tmp_path: Path):
+def test_capability_probe_rejects_authenticated_runner_environment(tmp_path: Path):
     cfg = make_issue_config(tmp_path)
     # Default gh_command is denied script from make_config
     from agent_ops.runners.runner import (

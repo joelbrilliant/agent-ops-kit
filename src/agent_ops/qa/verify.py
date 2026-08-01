@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Mapping, Sequence
+from typing import List, Mapping, Optional, Sequence
 
 from agent_ops.contracts import CheckResultV1
 from agent_ops.process import run_argv
@@ -15,6 +15,7 @@ def run_named_verifications(
     cwd: Path,
     subject_ref: str,
     timeout: int = 1800,
+    env: Optional[Mapping[str, str]] = None,
 ) -> List[CheckResultV1]:
     results: List[CheckResultV1] = []
     for name, argv in commands.items():
@@ -28,7 +29,9 @@ def run_named_verifications(
                 )
             )
             continue
-        proc = run_argv(list(argv), cwd=cwd, timeout=timeout, check=False)
+        proc = run_argv(
+            list(argv), cwd=cwd, env=env, timeout=timeout, check=False
+        )
         status = "PASS" if proc.ok else "HOLD"
         summary = f"exit={proc.returncode}"
         results.append(

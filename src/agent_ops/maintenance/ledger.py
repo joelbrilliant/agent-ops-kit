@@ -467,3 +467,20 @@ class Ledger:
         if not row:
             return False
         return row.status in ("completed", "held", "claimed", "running", "failed")
+
+    def has_completed_issue(self, repository: str, issue_number: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM claims
+                WHERE lower(repository) = lower(?)
+                  AND pr_number = ?
+                  AND thread_node_id = 'issue'
+                  AND status = 'completed'
+                  AND outcome = 'completed'
+                LIMIT 1
+                """,
+                (repository, issue_number),
+            ).fetchone()
+        return row is not None

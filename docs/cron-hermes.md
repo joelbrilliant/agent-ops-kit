@@ -38,4 +38,4 @@ After a safety failure the ledger circuit breaker opens. Diagnose, then:
 agent-ops pr clear-circuit --config "$HOME/.config/agent-ops/config.json"
 ```
 
-Paused or circuit-open sweeps still inspect account-wide PR or issue state, then stop without claiming work, launching Oscar, creating worktrees, pushing, or replying.
+Paused or circuit-open sweeps stop without claiming work, launching runners, creating worktrees, pushing, or replying. Use the explicit inspect commands for read-only operator visibility.

@@ -33,14 +33,14 @@ Local JSON only. Never commit real config or state directories.
 
 Optional `issue_automation` object. When present it must name exact repositories that already have exact `repository_policies` entries (wildcard-only policy is invalid).
 
-Required shape:
+Core shape:
 
 - `enabled` - boolean master switch
 - `enabled_repositories` - map of exact `owner/name` to base branch
-- `require_labels` or `trigger_label` - maintainer-only trigger label(s); default via `trigger_label` is `agent-ops:ready`
+- `trigger_label` or `require_labels` - choose one; when both are omitted the trigger defaults to `agent-ops:ready`
 - `branch_prefix` - safe ref prefix (default `agent-ops/issue`)
 - `classifier_command` / `builder_command` / `reviewer_command` - argv templates with the same fixed placeholders as PR automation
-- `build_runner_identity` / `review_runner_identity` - distinct attested runner identities for sticky build-profile classify+build and fresh review-profile review-fix
+- `build_runner_identity` / `review_runner_identity` - exactly attested identities with distinct profile names for sticky build-profile classify+build and fresh review-profile review-fix
 
 Optional bounds and templates:
 
@@ -79,7 +79,7 @@ The reviewer response includes a short public-community reply draft and `VoiceGa
 
 ## Capability isolation
 
-Oscar subprocesses receive a new local `HOME`, empty Git credential configuration, a new `GH_CONFIG_DIR`, and only environment variables named in `capability_isolation.environment_allowlist`. Do not add GitHub tokens, credential-helper variables, operator home paths, or messaging credentials to that allowlist. Before any runner starts, the orchestrator proves that `gh auth status` fails inside this environment while separately attesting the orchestrator's GitHub identity.
+Runner subprocesses receive profile-separated local `HOME` directories, empty Git credential configuration, separate `GH_CONFIG_DIR` values, and only environment variables named in `capability_isolation.environment_allowlist`. GitHub, credential-helper, operator-home and messaging credential names are rejected from that allowlist. The orchestrator independently proves that `gh auth status` fails in both issue runner environments while separately attesting its own GitHub identity.
 
 `capability_isolation.private_markers` should contain stable local path or operator-specific fragments that must never appear in receipts or public reply drafts. Do not put credentials in config.
 

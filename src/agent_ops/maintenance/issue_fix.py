@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import codecs
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -34,9 +36,11 @@ from agent_ops.maintenance.ledger import Ledger, make_claim_key
 from agent_ops.maintenance.worktree import (
     base_is_ancestor,
     changed_files,
+    commit_messages,
     create_worktree,
     current_head,
     diff_text,
+    local_config_fingerprint,
     push_head_no_force,
     remote_ref_sha,
     remove_worktree,
@@ -92,12 +96,12 @@ class IssueJobOutcome:
 
 
 def _issue_claim_key(signal: IssueSignalV1) -> str:
-    # Packet AC-7: repository + issue + observed updated_at + observed default-branch tip SHA
+    # Packet AC-7: repository + issue + conversation digest + observed default-branch tip SHA
     return make_claim_key(
         signal.repository,
         signal.issue_number,
         "issue",
-        signal.observed_updated_at,
+        signal.conversation_digest,
         signal.observed_base_sha,
     )
 
@@ -145,33 +149,26 @@ def _branch_name(issue_cfg: IssueAutomationConfig, signal: IssueSignalV1) -> str
     return f"{issue_cfg.branch_prefix}-{signal.issue_number}-{short}"
 
 
-def _owned_namespaces(config: Config) -> set[str]:
-    owned = {login.lower() for login in config.operator_logins}
-    owned.update(namespace.lower() for namespace in config.owned_namespaces)
-    return owned
-
-
-def _can_push_repository(
+def _assert_repository_authority(
     client: GitHubClient,
     repository: str,
     operator_logins: Sequence[str],
-    owned_namespaces: Sequence[str] = (),
-) -> bool:
+) -> None:
     data = client.rest_get(f"/repos/{repository}")
-    permissions = data.get("permissions") or {}
-    push = bool(permissions.get("push") or permissions.get("maintain") or permissions.get("admin"))
+    if not isinstance(data, dict):
+        raise RunnerContractError("repository_authority_payload_invalid")
+    if str(data.get("full_name") or "").lower() != repository.lower():
+        raise RunnerContractError("repository_identity_mismatch")
+    if data.get("private") is not False:
+        raise RunnerContractError("repository_not_public")
+    permissions = data.get("permissions")
+    if not isinstance(permissions, dict):
+        raise RunnerContractError("repository_permissions_missing")
+    if not any(permissions.get(name) is True for name in ("push", "maintain", "admin")):
+        raise RunnerContractError("repository_push_permission_missing")
     owner = str((data.get("owner") or {}).get("login") or "").lower()
-    full_name = str(data.get("full_name") or repository).lower()
-    allowed = {login.lower() for login in operator_logins}
-    allowed.update(namespace.lower() for namespace in owned_namespaces)
-    owner_ok = (not owner) or owner in allowed
-    ns_ok = full_name.split("/", 1)[0] in allowed
-    return push and (owner_ok or ns_ok)
-
-
-def _repo_is_public(client: GitHubClient, repository: str) -> bool:
-    data = client.rest_get(f"/repos/{repository}")
-    return not bool(data.get("private"))
+    if not owner or owner not in {login.lower() for login in operator_logins}:
+        raise RunnerContractError("repository_not_operator_owned")
 
 
 def _assert_issue_last_safe_point(
@@ -182,6 +179,9 @@ def _assert_issue_last_safe_point(
     *,
     branch: str,
     stale_reason: str,
+    decision: DecisionV1,
+    allowed_paths: Sequence[str],
+    verification_commands: Dict[str, List[str]],
 ) -> IssueSignalV1:
     """Re-prove AC-4 gates immediately before worktree create and before mutation."""
     if config.exact_policy_for(signal.repository) is None:
@@ -191,6 +191,10 @@ def _assert_issue_last_safe_point(
         raise RunnerContractError("repository_not_enabled_for_issue_automation")
     if expected_base != signal.base_ref:
         raise RunnerContractError("issue_base_ref_policy_mismatch")
+    if _policy_paths(config, signal.repository) != list(allowed_paths):
+        raise RunnerContractError("issue_path_policy_changed")
+    if _select_verifications(config, signal.repository, decision) != verification_commands:
+        raise RunnerContractError("issue_verification_policy_changed")
 
     live, skip, meta = fetch_issue_snapshot(
         client,
@@ -212,20 +216,12 @@ def _assert_issue_last_safe_point(
         raise RunnerContractError(stale_reason)
     if (
         issue_cfg.require_labels
-        and not any(label in live.labels for label in issue_cfg.require_labels)
+        and not all(label in live.labels for label in issue_cfg.require_labels)
     ):
         raise RunnerContractError("label_removed_before_push")
-    if meta and meta.get("is_private") is True:
+    if meta is None or meta.get("is_private") is not False:
         raise RunnerContractError("repository_not_public")
-    if not _repo_is_public(client, signal.repository):
-        raise RunnerContractError("repository_not_public")
-    if not _can_push_repository(
-        client,
-        signal.repository,
-        config.operator_logins,
-        owned_namespaces=sorted(_owned_namespaces(config)),
-    ):
-        raise RunnerContractError("repository_push_permission_missing")
+    _assert_repository_authority(client, signal.repository, config.operator_logins)
     existing = remote_ref_sha(config.git_command, signal.clone_url, branch)
     if existing is not None:
         raise RunnerContractError("target_branch_exists")
@@ -277,6 +273,84 @@ def _policy_paths(config: Config, repository: str) -> List[str]:
     if any(not is_safe_repo_path(p) for p in paths):
         raise RunnerContractError("policy_path_unsafe")
     return paths
+
+
+def _effective_private_markers(config: Config) -> List[str]:
+    markers = list(config.private_markers)
+    markers.extend((str(config.workspace_root), str(config.state_dir), str(Path.home())))
+    return list(dict.fromkeys(marker for marker in markers if marker))
+
+
+def _untrusted_text_markers(signal: IssueSignalV1) -> List[str]:
+    values = [signal._raw_title, signal._raw_body]
+    values.extend(
+        str(comment.get("body") or "")
+        for comment in signal._raw_comments
+        if isinstance(comment, dict)
+    )
+    markers: List[str] = []
+    for value in values:
+        stripped = value.strip()
+        if len(stripped) >= 24:
+            markers.append(stripped)
+        markers.extend(
+            line.strip() for line in value.splitlines() if len(line.strip()) >= 24
+        )
+    return list(dict.fromkeys(markers))
+
+
+def _assert_public_text_safe(
+    text: str,
+    signal: IssueSignalV1,
+    private_markers: Sequence[str],
+) -> None:
+    markers = list(private_markers) + _untrusted_text_markers(signal)
+    if assert_no_private_material(text, markers):
+        raise RunnerContractError("public_material_privacy_failure")
+
+
+def _assert_public_candidate_safe(
+    config: Config,
+    signal: IssueSignalV1,
+    worktree: Path,
+    base_sha: str,
+    changed: Sequence[str],
+) -> None:
+    markers = _effective_private_markers(config) + _untrusted_text_markers(signal)
+    public_text = "\n".join(
+        (
+            diff_text(config.git_command, worktree, base_sha),
+            commit_messages(config.git_command, worktree, base_sha),
+            "\n".join(changed),
+        )
+    )
+    if assert_no_private_material(public_text, markers):
+        raise RunnerContractError("public_candidate_privacy_failure")
+
+    carry_limit = max([512, *(len(marker) for marker in markers)])
+    for relative in changed:
+        target = worktree / relative
+        if not target.exists() and not target.is_symlink():
+            continue
+        if target.is_symlink():
+            _assert_public_text_safe(os.readlink(target), signal, markers)
+            continue
+        if not target.is_file():
+            raise RunnerContractError("changed_path_not_regular_file")
+        decoder = codecs.getincrementaldecoder("utf-8")("ignore")
+        carry = ""
+        with target.open("rb") as handle:
+            while True:
+                chunk = handle.read(65536)
+                if not chunk:
+                    text = carry + decoder.decode(b"", final=True)
+                    if text and assert_no_private_material(text, markers):
+                        raise RunnerContractError("public_candidate_privacy_failure")
+                    break
+                text = carry + decoder.decode(chunk)
+                if assert_no_private_material(text, markers):
+                    raise RunnerContractError("public_candidate_privacy_failure")
+                carry = text[-carry_limit:]
 
 
 def _issue_allowed_paths(
@@ -425,10 +499,10 @@ def _receipt(
         issue_reply_node_id=issue_reply_node_id,
         named_checks=[check.check_id for check in checks],
         outcome=outcome,
-        hold_reason=redact_text(hold_reason or "", config.private_markers) or None,
+        hold_reason=redact_text(hold_reason or "", _effective_private_markers(config)) or None,
         redaction_record=default_redaction_record(),
     )
-    return write_issue_receipt(config.state_dir, receipt, config.private_markers)
+    return write_issue_receipt(config.state_dir, receipt, _effective_private_markers(config))
 
 
 def _hold_job(
@@ -444,7 +518,7 @@ def _hold_job(
     circuit: bool,
     branch_name: str = "",
 ) -> IssueJobOutcome:
-    safe_reason = redact_text(reason, config.private_markers)
+    safe_reason = redact_text(reason, _effective_private_markers(config))
     if circuit:
         ledger.fail_job_open_circuit(job_id, claim_key, safe_reason)
     receipt_path = _receipt(
@@ -482,24 +556,41 @@ def _issue_text_blob(signal: IssueSignalV1) -> str:
 
 
 def _hold_markers_in_issue(signal: IssueSignalV1) -> Optional[str]:
-    """Deterministic pre-worktree injection hold for obvious unsafe issue text."""
+    """Deterministic pre-worktree hold for explicit unsafe exception markers."""
     lower = _issue_text_blob(signal).lower()
-    markers = [
-        "ignore previous",
-        "exfiltrat",
-        "credential",
-        "force push",
-        "drop table",
-        "product direction",
-        "api key",
-        "prompt injection",
-        "production deploy",
-        "change permissions",
-        "delete the database",
-    ]
-    for marker in markers:
+    markers = {
+        "ignore previous": "prompt_injection",
+        "prompt injection": "prompt_injection",
+        "exfiltrat": "security_sensitive_work",
+        "credential": "credential_change",
+        "api key": "credential_change",
+        "force push": "destructive_work",
+        "drop table": "destructive_work",
+        "delete the database": "destructive_work",
+        "delete history": "destructive_work",
+        "product direction": "product_direction",
+        "product roadmap": "product_direction",
+        "rewrite the architecture": "architecture_change",
+        "conflicting requirements": "ambiguous_acceptance",
+        "acceptance criteria conflict": "ambiguous_acceptance",
+        "another repository": "cross_repository_change",
+        "cross-repo": "cross_repository_change",
+        "ci workflow": "workflow_change",
+        ".github/workflows": "workflow_change",
+        "repository permissions": "permission_change",
+        "repository settings": "settings_change",
+        "branch protection": "settings_change",
+        "vendor bundle": "generated_or_vendor_change",
+        "generated fixture": "generated_or_vendor_change",
+        "schema migration": "database_migration",
+        "database migration": "database_migration",
+        "destructive data loss": "database_migration",
+        "production deploy": "production_effects",
+        "change permissions": "permission_change",
+    }
+    for marker, reason in markers.items():
         if marker in lower:
-            return f"hold_marker:{marker}"
+            return reason
     return None
 
 
@@ -510,14 +601,14 @@ def run_claimed_issue_job(
     signal: IssueSignalV1,
     job_id: str,
     claim_key: str,
-    runner_environment: Dict[str, str],
+    build_environment: Dict[str, str],
+    review_environment: Dict[str, str],
 ) -> IssueJobOutcome:
     issue_cfg = _require_issue_cfg(config)
     checks: List[CheckResultV1] = []
     worktree: Optional[Path] = None
     resulting_sha: Optional[str] = None
     branch = _branch_name(issue_cfg, signal)
-    mutation_started = False
     ledger.mark_running(job_id, claim_key)
     try:
         pre_hold = _hold_markers_in_issue(signal)
@@ -558,7 +649,7 @@ def run_claimed_issue_job(
             state_dir=config.state_dir,
             run_id=job_id,
             required_identity=issue_cfg.build_runner_identity,
-            runner_environment=runner_environment,
+            runner_environment=build_environment,
             timeout=config.runner_timeout_seconds,
         )
         decision = classifier.decision
@@ -569,13 +660,19 @@ def run_claimed_issue_job(
                 signal=signal,
                 job_id=job_id,
                 claim_key=claim_key,
-                reason=decision.reason or "classifier_hold",
+                reason="classifier_hold",
                 checks=checks,
                 resulting_sha=None,
                 circuit=False,
                 branch_name=branch,
             )
 
+        prove_github_capability_isolation(
+            client=client,
+            operator_logins=config.operator_logins,
+            gh_command=config.gh_command,
+            runner_environment=build_environment,
+        )
         allowed_paths = _issue_allowed_paths(config, signal.repository, decision)
         verification_commands = _select_verifications(config, signal.repository, decision)
 
@@ -587,6 +684,9 @@ def run_claimed_issue_job(
             signal,
             branch=branch,
             stale_reason="issue_snapshot_stale_before_build",
+            decision=decision,
+            allowed_paths=allowed_paths,
+            verification_commands=verification_commands,
         )
 
         ledger.mark_phase(job_id, "preparing")
@@ -601,6 +701,7 @@ def run_claimed_issue_job(
         )
         if current_head(config.git_command, worktree) != signal.observed_base_sha:
             raise RunnerContractError("worktree_not_at_observed_sha")
+        trusted_git_config = local_config_fingerprint(config.git_command, worktree)
 
         task = TaskSpecV1(
             goal="Apply one bounded routine issue fix and commit it locally",
@@ -637,16 +738,27 @@ def run_claimed_issue_job(
             continuation_token=classifier.continuation_token,
             classifier_identity=classifier.identity,
             required_identity=issue_cfg.build_runner_identity,
-            runner_environment=runner_environment,
+            runner_environment=build_environment,
             timeout=config.runner_timeout_seconds,
         )
-        candidate_sha, _ = _validate_local_candidate(
+        prove_github_capability_isolation(
+            client=client,
+            operator_logins=config.operator_logins,
+            gh_command=config.gh_command,
+            runner_environment=build_environment,
+        )
+        if local_config_fingerprint(config.git_command, worktree) != trusted_git_config:
+            raise RunnerContractError("runner_modified_git_config")
+        candidate_sha, candidate_paths = _validate_local_candidate(
             config,
             worktree,
             signal.observed_base_sha,
             allowed_paths,
             builder.changed_paths,
             issue_cfg=issue_cfg,
+        )
+        _assert_public_candidate_safe(
+            config, signal, worktree, signal.observed_base_sha, candidate_paths
         )
         if builder.resulting_sha != candidate_sha:
             raise RunnerContractError("builder_resulting_sha_mismatch")
@@ -657,11 +769,33 @@ def run_claimed_issue_job(
             cwd=worktree,
             subject_ref=candidate_sha,
             timeout=config.runner_timeout_seconds,
+            env=build_environment,
         )
         if not all_passed(checks):
             raise RunnerContractError("builder_verification_failed")
+        verified_candidate_sha, candidate_paths = _validate_local_candidate(
+            config,
+            worktree,
+            signal.observed_base_sha,
+            allowed_paths,
+            builder.changed_paths,
+            issue_cfg=issue_cfg,
+        )
+        if verified_candidate_sha != candidate_sha:
+            raise RunnerContractError("verification_mutated_candidate")
+        if local_config_fingerprint(config.git_command, worktree) != trusted_git_config:
+            raise RunnerContractError("verification_modified_git_config")
+        _assert_public_candidate_safe(
+            config, signal, worktree, signal.observed_base_sha, candidate_paths
+        )
 
         ledger.mark_phase(job_id, "reviewing")
+        prove_github_capability_isolation(
+            client=client,
+            operator_logins=config.operator_logins,
+            gh_command=config.gh_command,
+            runner_environment=review_environment,
+        )
         reviewer = run_issue_reviewer(
             issue_cfg.reviewer_command,
             task=task,
@@ -674,15 +808,26 @@ def run_claimed_issue_job(
             run_id=job_id,
             classifier_identity=classifier.identity,
             required_identity=issue_cfg.review_runner_identity,
-            runner_environment=runner_environment,
+            runner_environment=review_environment,
             timeout=config.runner_timeout_seconds,
         )
-        resulting_sha, _ = _validate_local_candidate(
+        prove_github_capability_isolation(
+            client=client,
+            operator_logins=config.operator_logins,
+            gh_command=config.gh_command,
+            runner_environment=review_environment,
+        )
+        if local_config_fingerprint(config.git_command, worktree) != trusted_git_config:
+            raise RunnerContractError("reviewer_modified_git_config")
+        resulting_sha, resulting_paths = _validate_local_candidate(
             config,
             worktree,
             signal.observed_base_sha,
             allowed_paths,
             issue_cfg=issue_cfg,
+        )
+        _assert_public_candidate_safe(
+            config, signal, worktree, signal.observed_base_sha, resulting_paths
         )
         if reviewer.resulting_sha != resulting_sha:
             raise RunnerContractError("reviewer_resulting_sha_mismatch")
@@ -695,24 +840,43 @@ def run_claimed_issue_job(
             cwd=worktree,
             subject_ref=resulting_sha,
             timeout=config.runner_timeout_seconds,
+            env=review_environment,
         )
         if not all_passed(checks):
             raise RunnerContractError("final_verification_failed")
+        final_verified_sha, resulting_paths = _validate_local_candidate(
+            config,
+            worktree,
+            signal.observed_base_sha,
+            allowed_paths,
+            issue_cfg=issue_cfg,
+        )
+        if final_verified_sha != resulting_sha:
+            raise RunnerContractError("final_verification_mutated_candidate")
+        if local_config_fingerprint(config.git_command, worktree) != trusted_git_config:
+            raise RunnerContractError("final_verification_modified_git_config")
+        _assert_public_candidate_safe(
+            config, signal, worktree, signal.observed_base_sha, resulting_paths
+        )
         check_ids = [check.check_id for check in checks]
         _validate_reply_draft(
             reviewer.reply_draft,
             resulting_sha,
             check_ids,
-            config.private_markers,
+            _effective_private_markers(config),
         )
-        pr_title_findings = assert_no_private_material(
-            reviewer.pr_title, config.private_markers
+        pr_title = _compose_pr_title(issue_cfg, signal, reviewer.pr_title)
+        pr_body = (
+            reviewer.pr_body
+            if f"closes #{signal.issue_number}" in reviewer.pr_body.lower()
+            else reviewer.pr_body.rstrip() + f"\n\nCloses #{signal.issue_number}\n"
         )
-        pr_body_findings = assert_no_private_material(
-            reviewer.pr_body, config.private_markers
+        _assert_public_text_safe(
+            pr_title, signal, _effective_private_markers(config)
         )
-        if pr_title_findings or pr_body_findings:
-            raise RunnerContractError("pr_copy_privacy_failure")
+        _assert_public_text_safe(
+            pr_body, signal, _effective_private_markers(config)
+        )
 
         ledger.mark_phase(job_id, "pre_push")
         # Last safe point: re-prove policy, ownership, public visibility, pushability,
@@ -724,10 +888,26 @@ def run_claimed_issue_job(
             signal,
             branch=branch,
             stale_reason="issue_stale_before_push",
+            decision=decision,
+            allowed_paths=allowed_paths,
+            verification_commands=verification_commands,
+        )
+        pre_push_sha, resulting_paths = _validate_local_candidate(
+            config,
+            worktree,
+            signal.observed_base_sha,
+            allowed_paths,
+            issue_cfg=issue_cfg,
+        )
+        if pre_push_sha != resulting_sha:
+            raise RunnerContractError("candidate_changed_before_push")
+        if local_config_fingerprint(config.git_command, worktree) != trusted_git_config:
+            raise RunnerContractError("git_config_changed_before_push")
+        _assert_public_candidate_safe(
+            config, signal, worktree, signal.observed_base_sha, resulting_paths
         )
 
         ledger.mark_phase(job_id, "pushing")
-        mutation_started = True
         push_result = push_head_no_force(
             git_cmd=config.git_command,
             worktree=worktree,
@@ -746,13 +926,8 @@ def run_claimed_issue_job(
             repository=signal.repository,
             base_ref=signal.base_ref,
             head_ref=branch,
-            title=_compose_pr_title(issue_cfg, signal, reviewer.pr_title),
-            body=(
-                reviewer.pr_body
-                if f"Closes #{signal.issue_number}" in reviewer.pr_body
-                or f"closes #{signal.issue_number}" in reviewer.pr_body.lower()
-                else reviewer.pr_body.rstrip() + f"\n\nCloses #{signal.issue_number}\n"
-            ),
+            title=pr_title,
+            body=pr_body,
         )
         create_mismatch = verify_draft_pr_readback(
             created,
@@ -785,7 +960,10 @@ def run_claimed_issue_job(
             final_reply,
             resulting_sha,
             check_ids,
-            config.private_markers,
+            _effective_private_markers(config),
+        )
+        _assert_public_text_safe(
+            final_reply, signal, _effective_private_markers(config)
         )
         if readback.url not in final_reply:
             raise RunnerContractError("reply_missing_draft_pr_url")
@@ -824,37 +1002,10 @@ def run_claimed_issue_job(
             resulting_sha=resulting_sha,
         )
     except (RunnerContractError, RunnerError, GitHubError, OSError, ValueError) as exc:
-        reason = redact_text(str(exc) or exc.__class__.__name__, config.private_markers)
-        # After mutation starts, any failure is ambiguous: open circuit.
-        circuit = mutation_started or reason.startswith(
-            (
-                "push_",
-                "remote_sha",
-                "pr_",
-                "createPullRequest",
-                "issue comment",
-                "addComment",
-            )
-        )
-        # Safety / identity / path / verification always open circuit.
-        safety_prefixes = (
-            "runner_identity",
-            "disallowed_changes",
-            "history_integrity",
-            "runner_github_auth",
-            "orchestrator_identity",
-            "builder_verification",
-            "final_verification",
-            "runner_left_dirty",
-            "classifier_scope",
-            "reply_draft_privacy",
-            "pr_copy_privacy",
-            "mutation",
-        )
-        if any(reason.startswith(p) or p in reason for p in safety_prefixes):
-            circuit = True
-        if mutation_started:
-            circuit = True
+        reason = redact_text(str(exc) or exc.__class__.__name__, _effective_private_markers(config))
+        # Every exception after a ROUTINE classification requires operator diagnosis.
+        # This includes stale state and all mutation-ambiguous failures.
+        circuit = True
         return _hold_job(
             config,
             ledger,
@@ -901,12 +1052,24 @@ def issue_sweep(
             exit_code=HELD,
             message="circuit_open:" + (ledger.circuit_reason() or "unknown"),
         )
+    ledger.reclaim_stale_jobs(config.reclaim_after_seconds)
+    if ledger.circuit_open():
+        return IssueSweepOutcome(
+            exit_code=HELD,
+            message="circuit_open:" + (ledger.circuit_reason() or "unknown"),
+        )
     if ledger.active_job() is not None:
         return IssueSweepOutcome(exit_code=OK, message="busy_inspect_only")
 
-    discovered = discover_issue_signals(github, config)
+    try:
+        discovered = discover_issue_signals(github, config)
+    except (GitHubError, RunnerContractError, ValueError):
+        ledger.open_circuit("issue_discovery_failed")
+        return IssueSweepOutcome(exit_code=HELD, message="issue_discovery_failed")
     pending: List[IssueSignalV1] = []
     for signal in discovered.signals:
+        if ledger.has_completed_issue(signal.repository, signal.issue_number):
+            continue
         key = _issue_claim_key(signal)
         if ledger.is_processed(key):
             continue
@@ -927,7 +1090,7 @@ def issue_sweep(
         repository=signal.repository,
         pr_number=signal.issue_number,
         thread_node_id="issue",
-        latest_comment_node_id=signal.observed_updated_at,
+        latest_comment_node_id=signal.conversation_digest,
         observed_head_sha=signal.observed_base_sha,
         signal_digest=issue_signal_digest(signal),
         reclaim_after_seconds=config.reclaim_after_seconds,
@@ -962,34 +1125,41 @@ def issue_sweep(
             signals_found=len(pending),
         )
 
-    runner_environment = build_runner_environment(
-        state_dir=config.state_dir,
-        allowlist=config.runner_environment_allowlist,
-    )
     try:
-        prove_github_capability_isolation(
-            client=github,
-            operator_logins=config.operator_logins,
-            gh_command=config.gh_command,
-            runner_environment=runner_environment,
+        build_environment = build_runner_environment(
+            state_dir=config.state_dir / "issue-build",
+            allowlist=config.runner_environment_allowlist,
         )
-    except RunnerContractError as exc:
-        ledger.fail_job_open_circuit(job_id, claim_key, str(exc))
-        receipt = _receipt(
+        review_environment = build_runner_environment(
+            state_dir=config.state_dir / "issue-review",
+            allowlist=config.runner_environment_allowlist,
+        )
+        for environment in (build_environment, review_environment):
+            prove_github_capability_isolation(
+                client=github,
+                operator_logins=config.operator_logins,
+                gh_command=config.gh_command,
+                runner_environment=environment,
+            )
+    except (RunnerContractError, RunnerError, GitHubError, OSError, ValueError) as exc:
+        held = _hold_job(
             config,
+            ledger,
             signal=signal,
-            outcome="held",
+            job_id=job_id,
+            claim_key=claim_key,
+            reason=str(exc) or exc.__class__.__name__,
             checks=[],
             resulting_sha=None,
-            hold_reason=str(exc),
+            circuit=True,
         )
         return IssueSweepOutcome(
             exit_code=HELD,
-            message=str(exc),
+            message=held.message,
             inspected_issues=discovered.inspected_issues,
             signals_found=len(pending),
-            receipt_path=receipt,
-            receipt_paths=[receipt],
+            receipt_path=held.receipt_path,
+            receipt_paths=[held.receipt_path],
             jobs_held=1,
         )
 
@@ -1000,7 +1170,8 @@ def issue_sweep(
         signal,
         job_id,
         claim_key,
-        runner_environment,
+        build_environment,
+        review_environment,
     )
     return IssueSweepOutcome(
         exit_code=OK if outcome.completed else HELD,

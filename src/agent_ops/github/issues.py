@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from agent_ops.config import Config, IssueAutomationConfig
 from agent_ops.contracts import IssueSignalV1, body_digest
 from agent_ops.github.client import GitHubClient, GitHubError
+
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 @dataclass(frozen=True)
@@ -109,13 +113,21 @@ def _paginate_issue_search(client: GitHubClient, query: str) -> List[Dict[str, A
     per_page = 100
     items: List[Dict[str, Any]] = []
     seen_ids: Set[str] = set()
+    expected_total: Optional[int] = None
     while True:
         payload = client.rest_search_issues(query, page=page, per_page=per_page)
         if not isinstance(payload, dict):
             raise GitHubError("issue search returned non-object payload")
         incomplete = payload.get("incomplete_results")
-        if incomplete is True:
-            raise GitHubError("issue search pagination incomplete_results=true")
+        if incomplete is not False:
+            raise GitHubError("issue search pagination completeness unproved")
+        total_count = payload.get("total_count")
+        if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
+            raise GitHubError("issue search total_count invalid")
+        if expected_total is None:
+            expected_total = total_count
+        elif total_count != expected_total:
+            raise GitHubError("issue search total_count changed during pagination")
         batch = payload.get("items")
         if not isinstance(batch, list):
             raise GitHubError("issue search missing items array")
@@ -125,16 +137,21 @@ def _paginate_issue_search(client: GitHubClient, query: str) -> List[Dict[str, A
             if not isinstance(item, dict):
                 raise GitHubError("issue search item is not an object")
             key = str(item.get("node_id") or item.get("id") or "")
-            if key and key in seen_ids:
+            if not key:
+                raise GitHubError("issue search item missing stable identity")
+            if key in seen_ids:
                 continue
-            if key:
-                seen_ids.add(key)
+            seen_ids.add(key)
             items.append(item)
-        if len(batch) < per_page:
+        if len(items) == expected_total:
             break
+        if len(items) > expected_total or len(batch) < per_page:
+            raise GitHubError("issue search pagination ended before total_count")
         page += 1
         if page > 50:
             raise GitHubError("issue search exceeded page safety limit")
+    if expected_total is None or len(items) != expected_total:
+        raise GitHubError("issue search pagination count mismatch")
     return items
 
 
@@ -154,9 +171,9 @@ def fetch_base_sha(client: GitHubClient, repository: str, base_ref: str) -> str:
     if not isinstance(ref, dict):
         raise GitHubError(f"base ref not found: {repository}@{base_ref}")
     oid = ((ref.get("target") or {}).get("oid")) if isinstance(ref.get("target"), dict) else None
-    if not isinstance(oid, str) or len(oid) < 7:
+    if not isinstance(oid, str) or not _SHA_RE.fullmatch(oid.lower()):
         raise GitHubError(f"base ref oid missing: {repository}@{base_ref}")
-    return oid
+    return oid.lower()
 
 
 def _fetch_all_comments(
@@ -167,25 +184,54 @@ def _fetch_all_comments(
     number: int,
     first_page: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    nodes = list(first_page.get("nodes") or [])
-    page_info = first_page.get("pageInfo") or {}
+    first_nodes = first_page.get("nodes")
+    page_info = first_page.get("pageInfo")
+    if not isinstance(first_nodes, list) or not isinstance(page_info, dict):
+        raise GitHubError("issue comments first page malformed")
+    if not isinstance(page_info.get("hasNextPage"), bool):
+        raise GitHubError("issue comments pagination completeness unproved")
+    nodes: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+    for node in first_nodes:
+        if not isinstance(node, dict) or not str(node.get("id") or ""):
+            raise GitHubError("issue comment node malformed")
+        comment_id = str(node["id"])
+        if comment_id in seen_ids:
+            raise GitHubError("duplicate issue comment node")
+        seen_ids.add(comment_id)
+        nodes.append(node)
+    seen_cursors: Set[str] = set()
     if page_info.get("hasNextPage") is True and not page_info.get("endCursor"):
         raise GitHubError("issue comments pagination missing endCursor")
     while page_info.get("hasNextPage"):
         cursor = page_info.get("endCursor")
-        if not cursor:
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
             raise GitHubError("issue comments pagination incomplete")
+        seen_cursors.add(cursor)
         data = client.graphql(
             ISSUE_COMMENTS_PAGE_QUERY,
             {"owner": owner, "name": name, "number": number, "after": cursor},
         )
         issue = (((data or {}).get("data") or {}).get("repository") or {}).get("issue") or {}
-        comments = issue.get("comments") or {}
-        batch = comments.get("nodes") or []
+        comments = issue.get("comments")
+        if not isinstance(comments, dict):
+            raise GitHubError("issue comments page missing")
+        batch = comments.get("nodes")
         if not isinstance(batch, list):
             raise GitHubError("issue comments page missing nodes")
-        nodes.extend(batch)
-        page_info = comments.get("pageInfo") or {}
+        for node in batch:
+            if not isinstance(node, dict) or not str(node.get("id") or ""):
+                raise GitHubError("issue comment node malformed")
+            comment_id = str(node["id"])
+            if comment_id in seen_ids:
+                raise GitHubError("duplicate issue comment node")
+            seen_ids.add(comment_id)
+            nodes.append(node)
+        page_info = comments.get("pageInfo")
+        if not isinstance(page_info, dict):
+            raise GitHubError("issue comments pagination metadata missing")
+        if not isinstance(page_info.get("hasNextPage"), bool):
+            raise GitHubError("issue comments pagination completeness unproved")
         if page_info.get("hasNextPage") is True and not page_info.get("endCursor"):
             raise GitHubError("issue comments pagination missing endCursor")
     return nodes
@@ -212,12 +258,26 @@ def fetch_issue_snapshot(
     issue = repo.get("issue")
     if not isinstance(issue, dict):
         return None, IssueSkip(repository, issue_number, "issue_missing"), None
+    if int(issue.get("number") or 0) != issue_number:
+        raise GitHubError("issue snapshot number mismatch")
+    if not isinstance(issue.get("id"), str) or not issue.get("id"):
+        raise GitHubError("issue snapshot node id missing")
+    if not isinstance(issue.get("updatedAt"), str) or not issue.get("updatedAt"):
+        raise GitHubError("issue snapshot updatedAt missing")
 
     if str(issue.get("state") or "").upper() != "OPEN":
         return None, IssueSkip(repository, issue_number, "issue_not_open", str(issue.get("id") or "")), None
 
-    labels_payload = issue.get("labels") or {}
-    if labels_payload.get("pageInfo", {}).get("hasNextPage"):
+    labels_payload = issue.get("labels")
+    if not isinstance(labels_payload, dict):
+        raise GitHubError("issue labels payload malformed")
+    labels_page_info = labels_payload.get("pageInfo")
+    if (
+        not isinstance(labels_page_info, dict)
+        or not isinstance(labels_page_info.get("hasNextPage"), bool)
+    ):
+        raise GitHubError("issue labels pagination completeness unproved")
+    if labels_page_info.get("hasNextPage"):
         return (
             None,
             IssueSkip(repository, issue_number, "labels_pagination_incomplete", str(issue.get("id") or "")),
@@ -244,7 +304,9 @@ def fetch_issue_snapshot(
             None,
         )
 
-    comments_payload = issue.get("comments") or {}
+    comments_payload = issue.get("comments")
+    if not isinstance(comments_payload, dict):
+        raise GitHubError("issue comments payload malformed")
     comments = _fetch_all_comments(
         client,
         owner=owner,
@@ -310,7 +372,7 @@ def fetch_issue_snapshot(
         clone_url=clone_url,
     )
     meta = {
-        "is_private": bool(repo.get("isPrivate")),
+        "is_private": repo.get("isPrivate"),
         "labels": sorted(label_names),
     }
     return signal, None, meta
@@ -341,11 +403,7 @@ def discover_issue_signals(
             continue
 
         query = _search_query(repository, cfg.require_labels)
-        try:
-            items = _paginate_issue_search(client, query)
-        except GitHubError as exc:
-            skips.append(IssueSkip(repository, 0, f"search_failed:{exc}"))
-            continue
+        items = _paginate_issue_search(client, query)
 
         for item in items:
             # Search can still surface PRs if query is wrong; fail closed.

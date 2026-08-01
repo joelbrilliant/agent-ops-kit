@@ -79,12 +79,18 @@ class IssueReviewerResult:
 
 def write_owner_only_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink() or path.parent.resolve().parent != path.parent.parent.resolve():
+        raise RunnerContractError("runner_request_directory_escaped_state")
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     descriptor = os.open(
         str(path),
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        flags,
         stat.S_IRUSR | stat.S_IWUSR,
     )
+    os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(text)
 
@@ -107,10 +113,11 @@ def build_runner_environment(
     xdg_config = home / "xdg"
     for directory in (home, gh_config, xdg_config):
         directory.mkdir(parents=True, exist_ok=True)
-        try:
-            directory.chmod(0o700)
-        except OSError:
-            pass
+        if directory.is_symlink():
+            raise RunnerContractError("runner_environment_directory_is_symlink")
+        directory.chmod(0o700)
+        if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+            raise RunnerContractError("runner_environment_directory_not_owner_only")
     environment.update(
         {
             "HOME": str(home),
@@ -158,8 +165,11 @@ def _require_exact_keys(data: Dict[str, Any], expected: Sequence[str], label: st
 
 
 def _read_response(path: Path, schema: str, expected_keys: Sequence[str]) -> Dict[str, Any]:
-    if not path.is_file():
+    if path.parent.is_symlink() or path.parent.resolve().parent != path.parent.parent.resolve():
+        raise RunnerContractError(f"{schema}_response_directory_escaped_state")
+    if path.is_symlink() or not path.is_file():
         raise RunnerContractError(f"{schema}_missing_response")
+    path.chmod(0o600)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -700,7 +710,12 @@ def heuristic_decision_from_body(body: str, path: str) -> DecisionV1:
     ]
     for m in hold_markers:
         if m in lower:
-            return DecisionV1(verdict="HOLD", reason=f"hold_marker:{m}", requested_allowed_paths=[path] if path else [])
+            reason = "hold_marker_" + re.sub(r"[^a-z0-9]+", "_", m).strip("_")
+            return DecisionV1(
+                verdict="HOLD",
+                reason=reason,
+                requested_allowed_paths=[path] if path else [],
+            )
     if not path:
         return DecisionV1(verdict="HOLD", reason="missing_path")
     return DecisionV1(

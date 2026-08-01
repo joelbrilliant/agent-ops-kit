@@ -512,6 +512,16 @@ def test_issue_reviewer_fix_is_reverified(tmp_path: Path):
     )
     cfg = make_issue_config(tmp_path)
     assert cfg.issue_automation is not None
+    verification_counter = tmp_path / "verification-count.txt"
+    cfg.repository_policies["operator/demo"].verification_commands["unit"] = [
+        sys_executable(),
+        "-c",
+        (
+            "from pathlib import Path; "
+            f"p=Path({str(verification_counter)!r}); "
+            "p.write_text((p.read_text() if p.exists() else '') + 'x')"
+        ),
+    ]
     cfg.issue_automation.reviewer_command[:] = [
         sys_executable(),
         str(reviewer),
@@ -540,6 +550,7 @@ def test_issue_reviewer_fix_is_reverified(tmp_path: Path):
     ).stdout
     assert receipt["resulting_sha"] in refs
     assert receipt["resulting_sha"] != sha
+    assert verification_counter.read_text(encoding="utf-8") == "xx"
 
 
 def test_issue_job_holds_when_issue_changes_before_push(tmp_path: Path):

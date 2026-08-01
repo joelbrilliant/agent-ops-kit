@@ -267,13 +267,10 @@ class IssueSignalV1:
             "title_digest": self.title_digest,
             "body_digest": self.body_digest,
             "conversation_digest": self.conversation_digest,
-            "labels": list(self.labels),
-            "author_login": self.author_login,
             "observed_updated_at": self.observed_updated_at,
             "latest_comment_node_id": self.latest_comment_node_id,
             "base_ref": self.base_ref,
             "observed_base_sha": self.observed_base_sha,
-            "head_repository": self.head_repository or self.repository,
             "untrusted": True,
         }
 

@@ -26,7 +26,7 @@ IDENTITY_BUILD = RunnerIdentityPolicy(
     service_tier="fast",
 )
 IDENTITY_REVIEW = RunnerIdentityPolicy(
-    profile="oscar",
+    profile="review",
     provider="openai-codex",
     model="gpt-5.6-sol",
     reasoning_effort="xhigh",
@@ -148,7 +148,7 @@ def _issue_scripts(tmp: Path) -> Tuple[Path, Path, Path]:
             resp.write_text(json.dumps({
                 'schema': 'IssueReviewerResponseV1',
                 'runner_identity': {
-                    'profile': 'oscar', 'provider': 'openai-codex', 'model': 'gpt-5.6-sol',
+                    'profile': 'review', 'provider': 'openai-codex', 'model': 'gpt-5.6-sol',
                     'reasoning_effort': 'xhigh', 'service_tier': 'priority',
                     'session_id': 'issue-review-session', 'fresh_session': True,
                 },
@@ -446,7 +446,9 @@ def test_issue_public_signal_redacts_bodies(tmp_path: Path):
     assert "/Users/private" not in blob
     assert secret_body not in blob
     assert public["schema"] == "IssueSignalV1"
-    assert public["labels"] == ["agent-ops:ready"]
+    assert "labels" not in public
+    assert "author_login" not in public
+    assert "head_repository" not in public
 
 
 def test_issue_inspect_and_happy_path_draft_pr(tmp_path: Path):

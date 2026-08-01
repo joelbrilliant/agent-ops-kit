@@ -44,7 +44,7 @@ Search covers every configured operator login and owned namespace with fail-clos
 - `agent_ops.maintenance` - ledger, worktree, PR orchestrator, issue orchestrator
 - `agent_ops.runners` - external runner contract including IssueReviewerResponseV1
 - `agent_ops.qa` - named verification
-- `agent_ops.audit` - redaction + receipts
+- `agent_ops.audit` - redaction, receipts and read-only deterministic public receipt summaries
 - `agent_ops.process` - `shell=False` subprocess only
 
 ## Non-goals
@@ -52,3 +52,5 @@ Search covers every configured operator login and owned namespace with fail-clos
 No email, webhooks, auto-merge, deploy, memory kit, or private harness paths in the public core. Issue automation does not merge, close issues, mutate labels, force-push, or change repository settings.
 
 Slice 3 is not a general-autonomy claim. Portable evidence must be followed by the frozen packet's live canary sequence before operators enable issue automation.
+
+An audit report is a redacted local receipt summary. It excludes local receipt names and paths, raw request and response material, branch names and hold reasons. It is evidence that accepted receipt files validated, not proof of autonomous correctness or live readiness.

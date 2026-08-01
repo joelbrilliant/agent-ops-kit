@@ -310,6 +310,32 @@ class IssueDraftReceiptV1:
         }
 
 
+@dataclass(frozen=True)
+class AuditReportV1:
+    """Portable, public-safe summary of validated local receipts."""
+
+    schema: str
+    schema_version: str
+    report_id: str
+    verdict: str
+    summary: Dict[str, int]
+    items: List[Dict[str, Any]]
+    findings: List[Dict[str, str]]
+    redaction_record: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "schema_version": self.schema_version,
+            "report_id": self.report_id,
+            "verdict": self.verdict,
+            "summary": self.summary,
+            "items": self.items,
+            "findings": self.findings,
+            "redaction_record": self.redaction_record,
+        }
+
+
 def dumps_json(obj: Any) -> str:
     if hasattr(obj, "to_dict"):
         payload = obj.to_dict()

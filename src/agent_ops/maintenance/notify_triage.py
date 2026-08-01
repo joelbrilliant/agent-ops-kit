@@ -241,7 +241,8 @@ def _comment_body_decision(
             related_pr_number=pr_number,
             related_url=url,
         )
-    if _QUESTION_RE.search(text) and not _VALIDATION_ONLY_RE.search(text):
+    # Questions win over pure-validation matches. "LGTM - which option?" must not dismiss.
+    if _QUESTION_RE.search(text):
         return NotifyTriageDecisionV1(
             decision=DECISION_NEEDS_JOEL,
             reason="comment_asks_operator_question",
@@ -393,14 +394,35 @@ def classify_notification(
         return _classify_check_notification(client, config, note)
 
     pr_ref = parse_pr_ref(note.subject_url)
-    if subject_type in {"pullrequest", "issue"} and pr_ref:
+    if subject_type == "pullrequest" and pr_ref:
         repository, pr_number = pr_ref
         return _classify_pr_notification(
             client, config, note, repository=repository, pr_number=pr_number
         )
 
-    if subject_type == "issue" and pr_ref is None:
-        # Plain issue mention: only escalate if it looks operator-directed.
+    if subject_type == "issue" and pr_ref:
+        # GitHub often surfaces PR subjects via the issues URL. Try PR first; if the
+        # pulls endpoint 404s, this is a real issue - never silently dismiss.
+        repository, pr_number = pr_ref
+        decision = _classify_pr_notification(
+            client, config, note, repository=repository, pr_number=pr_number
+        )
+        if decision.reason not in {"pr_subject_gone", "pr_subject_not_found"}:
+            return decision
+        url = note.subject_url or _public_url(repository, pr_number)
+        return NotifyTriageDecisionV1(
+            decision=DECISION_NEEDS_JOEL,
+            reason="issue_notification_needs_human_scan",
+            joel_summary=(
+                f"NEEDS_JOEL: issue notification on {repo or repository or 'unknown'}: "
+                f"{title[:120]}. Not auto-actionable as a PR fix."
+            ),
+            mark_read=False,
+            related_repository=repo or repository,
+            related_url=url,
+        )
+
+    if subject_type == "issue":
         url = note.subject_url
         return NotifyTriageDecisionV1(
             decision=DECISION_NEEDS_JOEL,

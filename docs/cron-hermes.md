@@ -18,6 +18,8 @@ hermes cron create "0 */3 * * *" \
 agent-ops pr sweep --config "$HOME/.config/agent-ops/config.json"
 agent-ops pr inspect --config "$HOME/.config/agent-ops/config.json"
 agent-ops pr status --config "$HOME/.config/agent-ops/config.json"
+agent-ops issue inspect --config "$HOME/.config/agent-ops/config.json"
+agent-ops issue sweep --config "$HOME/.config/agent-ops/config.json"
 ```
 
 ## Global pause / disable
@@ -28,10 +30,12 @@ agent-ops pr pause --config "$HOME/.config/agent-ops/config.json"
 agent-ops pr resume --config "$HOME/.config/agent-ops/config.json"
 ```
 
+Issue automation shares the same pause file, ledger lock, and circuit breaker as the PR loop.
+
 After a safety failure the ledger circuit breaker opens. Diagnose, then:
 
 ```bash
 agent-ops pr clear-circuit --config "$HOME/.config/agent-ops/config.json"
 ```
 
-Paused or circuit-open sweeps still inspect account-wide PR state, then stop without claiming work, launching Oscar, creating worktrees, pushing, or replying.
+Paused or circuit-open sweeps still inspect account-wide PR or issue state, then stop without claiming work, launching Oscar, creating worktrees, pushing, or replying.

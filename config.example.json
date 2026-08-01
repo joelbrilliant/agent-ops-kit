@@ -73,8 +73,14 @@
     "enabled_repositories": {
       "YOUR_GITHUB_LOGIN/YOUR_REPOSITORY": "main"
     },
-    "trigger_label": "agent-ops:ready",
+    "require_labels": ["agent-ops:ready"],
+    "ignore_labels": [],
     "branch_prefix": "agent-ops/issue",
+    "draft_pr_title_template": "agent-ops: issue #{issue_number}",
+    "issue_reply_template": "Draft PR ready: {pr_url}\nSHA: {resulting_sha}\nChecks: {named_checks}",
+    "max_paths_per_issue": 8,
+    "max_changed_files": 20,
+    "max_diff_lines": 400,
     "classifier_command": [
       "python3",
       "/absolute/path/to/your-issue-classifier.py",

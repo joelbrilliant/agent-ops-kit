@@ -92,6 +92,8 @@ def _executable(value: dict[str, Any], key: str) -> str:
     result = value.get(key)
     if not isinstance(result, str) or not result or "\x00" in result or "\n" in result:
         raise ConfigError(f"{key} must be one executable path or name")
+    if result == "/usr/bin/open" or ".app/Contents/MacOS/" in result:
+        raise ConfigError(f"{key} must be headless")
     return result
 
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlparse
 
+from .checks import current_head_is_green, resolve_failed_workflow
 from .config import Config
 
 if TYPE_CHECKING:
@@ -20,8 +21,8 @@ _THREAD = re.compile(r"^[A-Za-z0-9_-]+$")
 _PULL_PATH = re.compile(r"^/repos/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pulls/(\d+)$")
 
 
-class GitHubError(RuntimeError):
-    pass
+class GitHubError(RuntimeError): pass
+class StaleNotification(GitHubError): pass
 @dataclass(frozen=True)
 class Notification:
     notification_id: str
@@ -73,10 +74,14 @@ class GitHub:
     def resolve(self, item: Notification) -> ResolvedNotification | None:
         source_head = item.source_head_sha
         number = item.pull_number
-        if number is None:
+        if number is None and item.subject_url:
             details = self._get_subject(item.subject_url)
             number = self._check_pull_number(details)
             source_head = self._text(details.get("head_sha"))
+        elif number is None and item.kind == "check":
+            number, source_head = resolve_failed_workflow(
+                item.repository, item.subject_title, item.updated_at, self._get
+            )
         if number is None or self.config is None:
             return None
         pull = self._pull(item.repository, number)
@@ -85,20 +90,14 @@ class GitHub:
         )
         return ResolvedNotification(item, pull, source_head, mutation_allowed, self._latest_comment_body(item.latest_comment_url))
     def head_is_green(self, item: ResolvedNotification) -> bool:
-        payload = self._get(f"/repos/{item.pull.repository}/commits/{item.pull.head_sha}/check-runs")
-        runs = payload.get("check_runs") if isinstance(payload, dict) else None
-        if not isinstance(runs, list) or not runs:
-            return False
-        return all(
-            isinstance(run, dict)
-            and run.get("status") == "completed"
-            and run.get("conclusion") in {"success", "neutral", "skipped"}
-            for run in runs
-        )
+        return current_head_is_green(item.pull.repository, item.pull.head_sha, self._get)
 
-    def mark_read(self, notification_id: str) -> None:
+    def mark_read(self, notification_id: str, expected_updated_at: str) -> None:
         if not _THREAD.fullmatch(notification_id):
             raise GitHubError("invalid notification id")
+        current = self._get(f"/notifications/threads/{notification_id}")
+        if not isinstance(current, dict) or self._text(current.get("updated_at")) != expected_updated_at:
+            raise StaleNotification("notification changed before mark-read")
         self._call(["gh", "api", "--method", "PATCH", f"/notifications/threads/{notification_id}"])
 
     def verify_completion(self, item: ResolvedNotification, result: WorkerResult) -> bool:
@@ -115,6 +114,9 @@ class GitHub:
         if not isinstance(comment, dict) or str(comment.get("id")) != str(result.comment_id) or self.config is None:
             return False
         if not isinstance(user, dict) or user.get("login") != self.config.github_login:
+            return False
+        comment_time = comment.get("submitted_at") if result.comment_kind == "review_summary" else comment.get("created_at")
+        if not self._text(comment.get("body")) or not isinstance(comment_time, str) or comment_time < item.notification.updated_at:
             return False
         if result.comment_kind == "review_summary":
             return True
@@ -135,18 +137,20 @@ class GitHub:
         updated_at = self._text(raw.get("updated_at"))
         subject_type = self._text(subject.get("type"))
         reason = self._text(raw.get("reason")) or "unknown"
-        if not all((full_name, subject_url, notification_id, updated_at, subject_type)) or not _REPOSITORY.fullmatch(full_name):
+        if not all((full_name, notification_id, updated_at, subject_type)) or not _REPOSITORY.fullmatch(full_name):
             return None
+        if subject_type in {"CheckSuite", "CheckRun"}:
+            return Notification(
+                notification_id, updated_at, full_name, None, subject_type, reason, "check", None,
+                subject_url, self._text(subject.get("title")) or "", self._api_url(subject.get("latest_comment_url")),
+            )
+        if subject_type == "PullRequest" and subject_url is None:
+            return Notification(notification_id, updated_at, full_name, None, subject_type, reason, "review", None)
         path = self._subject_path(subject_url)
         pull_match = _PULL_PATH.fullmatch(path or "")
         if pull_match and pull_match.group(1) == full_name:
             return Notification(
                 notification_id, updated_at, full_name, int(pull_match.group(2)), subject_type, reason, "review", None,
-                subject_url, self._text(subject.get("title")) or "", self._api_url(subject.get("latest_comment_url")),
-            )
-        if subject_type in {"CheckSuite", "CheckRun"}:
-            return Notification(
-                notification_id, updated_at, full_name, None, subject_type, reason, "check", None,
                 subject_url, self._text(subject.get("title")) or "", self._api_url(subject.get("latest_comment_url")),
             )
         return None

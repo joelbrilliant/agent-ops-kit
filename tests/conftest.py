@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from github_watch.config import Config
-from github_watch.github import Notification, PullRequest, ResolvedNotification
+from github_watch.github import Notification, PullRequest, ResolvedNotification, StaleNotification
 from github_watch.worker import WorkerResult
 
 
@@ -75,6 +75,7 @@ class FakeGitHub:
         self.verification = verification
         self.calls: list[tuple[str, str]] = []
         self.mark_failures = 0
+        self.mark_stale = False
 
     def list_notifications(self, limit: int):
         self.calls.append(("list", str(limit)))
@@ -88,8 +89,10 @@ class FakeGitHub:
         self.calls.append(("green", item.notification.notification_id))
         return self.green
 
-    def mark_read(self, notification_id: str) -> None:
+    def mark_read(self, notification_id: str, expected_updated_at: str) -> None:
         self.calls.append(("mark", notification_id))
+        if self.mark_stale:
+            raise StaleNotification("changed")
         if self.mark_failures:
             self.mark_failures -= 1
             raise RuntimeError("mark read failed")

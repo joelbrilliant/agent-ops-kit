@@ -71,7 +71,7 @@ class StateStore:
 
     def terminal_for(self, item: ResolvedNotification) -> StateRow | None:
         row = self.get(item.notification.notification_id, item.notification.updated_at)
-        if row and row.outcome in {"no_action", "completed", "blocked"} and row.head_sha == item.pull.head_sha:
+        if row and row.outcome in {"no_action", "completed", "blocked"}:
             return row
         return None
 
@@ -118,6 +118,17 @@ class StateStore:
         )
         self.connection.commit()
 
+    def record_unresolved(self, item: Notification, message: str) -> None:
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO notifications
+            (notification_id, source_updated_at, repository, pull_number, head_sha, outcome, message, updated_at)
+            VALUES (?, ?, ?, 0, '', 'blocked', ?, ?)
+            """,
+            (item.notification_id, item.updated_at, item.repository, message, self._now()),
+        )
+        self.connection.commit()
+
     def pending(self) -> list[StateRow]:
         rows = self.connection.execute(
             """
@@ -133,7 +144,13 @@ class StateStore:
         self._set(row, "read_completed = 1, last_error = NULL")
 
     def set_buzz(self, row: StateRow) -> None:
-        self._set(row, "buzz_completed = 1, last_error = NULL")
+        self._set(
+            row,
+            "buzz_completed = 1, last_error = CASE WHEN last_error = 'superseded before mark-read' THEN last_error ELSE NULL END",
+        )
+
+    def set_superseded(self, row: StateRow) -> None:
+        self._set(row, "read_completed = 1, last_error = 'superseded before mark-read'")
 
     def set_error(self, row: StateRow, error: str) -> None:
         self._set(row, "last_error = ?", (error[:240],))

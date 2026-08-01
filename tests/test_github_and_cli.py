@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 from github_watch.cli import main
-from github_watch.github import GitHub, Notification, PullRequest, ResolvedNotification
+from github_watch.github import GitHub, Notification, PullRequest, ResolvedNotification, StaleNotification
 from github_watch.worker import WorkerResult
 
 
@@ -38,7 +38,20 @@ def test_production_shaped_inspect_parses_notifications_without_mutation(config,
                 "url": "https://api.github.com/repos/acme/widget/pulls/7",
             },
             "repository": {"full_name": "acme/widget"},
-        }
+        },
+        {
+            "id": "thread-10",
+            "updated_at": "2026-08-02T00:01:00Z",
+            "unread": True,
+            "reason": "ci_activity",
+            "subject": {
+                "type": "CheckSuite",
+                "url": None,
+                "title": "CI workflow run failed for fix/widget branch",
+                "latest_comment_url": None,
+            },
+            "repository": {"full_name": "acme/widget"},
+        },
     ]
     calls = []
 
@@ -56,7 +69,14 @@ def test_production_shaped_inspect_parses_notifications_without_mutation(config,
             "pull_number": 7,
             "updated_at": "2026-08-02T00:00:00Z",
             "kind": "review",
-        }
+        },
+        {
+            "id": "thread-10",
+            "repository": "acme/widget",
+            "pull_number": None,
+            "updated_at": "2026-08-02T00:01:00Z",
+            "kind": "check",
+        },
     ]
     assert calls == [["gh", "api", "--method", "GET", "/notifications?all=false&participating=false&per_page=20"]]
 
@@ -99,13 +119,17 @@ def test_real_api_shaped_check_resolution_and_completion_verification_use_fixed_
             }
         elif endpoint == "/repos/acme/widget/issues/comments/43":
             payload = {"body": "The latest CI detail."}
-        elif endpoint == "/repos/acme/widget/commits/old-head/check-runs":
-            payload = {"check_runs": [{"status": "completed", "conclusion": "success"}]}
+        elif endpoint == "/repos/acme/widget/commits/old-head/check-runs?per_page=100":
+            payload = {"total_count": 1, "check_runs": [{"status": "completed", "conclusion": "success"}]}
+        elif endpoint == "/repos/acme/widget/commits/old-head/status":
+            payload = {"state": "pending", "statuses": []}
         elif endpoint == "/repos/acme/widget/issues/comments/44":
             payload = {
                 "id": 44,
                 "user": {"login": "joelbrilliant"},
                 "issue_url": "https://api.github.com/repos/acme/widget/issues/7",
+                "body": "Fixed the formatter and verified the check.",
+                "created_at": "2026-08-02T00:01:00Z",
             }
         else:
             raise AssertionError(endpoint)
@@ -125,7 +149,8 @@ def test_real_api_shaped_check_resolution_and_completion_verification_use_fixed_
         ["gh", "api", "--method", "GET", "/repos/acme/widget/check-suites/50"],
         ["gh", "api", "--method", "GET", "/repos/acme/widget/pulls/7"],
         ["gh", "api", "--method", "GET", "/repos/acme/widget/issues/comments/43"],
-        ["gh", "api", "--method", "GET", "/repos/acme/widget/commits/old-head/check-runs"],
+        ["gh", "api", "--method", "GET", "/repos/acme/widget/commits/old-head/check-runs?per_page=100"],
+        ["gh", "api", "--method", "GET", "/repos/acme/widget/commits/old-head/status"],
         ["gh", "api", "--method", "GET", "/repos/acme/widget/pulls/7"],
         ["gh", "api", "--method", "GET", "/repos/acme/widget/issues/comments/44"],
     ]
@@ -134,8 +159,8 @@ def test_real_api_shaped_check_resolution_and_completion_verification_use_fixed_
 @pytest.mark.parametrize(
     "comment",
     [
-        {"id": 44, "user": {"login": "someone-else"}, "issue_url": "/repos/acme/widget/issues/7"},
-        {"id": 44, "user": {"login": "joelbrilliant"}, "issue_url": "/repos/acme/widget/issues/8"},
+        {"id": 44, "user": {"login": "someone-else"}, "issue_url": "/repos/acme/widget/issues/7", "body": "fixed", "created_at": "2026-08-02T00:01:00Z"},
+        {"id": 44, "user": {"login": "joelbrilliant"}, "issue_url": "/repos/acme/widget/issues/8", "body": "fixed", "created_at": "2026-08-02T00:01:00Z"},
     ],
 )
 def test_completion_rejects_comment_author_or_pull_mismatch(config, comment):
@@ -155,6 +180,147 @@ def test_completion_rejects_comment_author_or_pull_mismatch(config, comment):
         return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
 
     assert GitHub(config, runner=runner).verify_completion(item, WorkerResult.completed("fixed", "new-head", "issue", 44)) is False
+
+
+def test_completion_rejects_an_old_or_empty_reply(config):
+    item = ResolvedNotification(
+        Notification("thread-11", "2026-08-02T00:00:00Z", "acme/widget", 7, "PullRequest", "comment", "review", None),
+        PullRequest("acme/widget", 7, "open", False, "new-head", "https://github.com/acme/widget/pull/7", "joelbrilliant"),
+        mutation_allowed=True,
+    )
+
+    def runner(argv, **kwargs):
+        endpoint = argv[-1]
+        payload = (
+            {"state": "open", "merged_at": None, "head": {"sha": "new-head"}, "html_url": item.pull.url, "user": {"login": "joelbrilliant"}}
+            if endpoint == "/repos/acme/widget/pulls/7"
+            else {"id": 44, "user": {"login": "joelbrilliant"}, "issue_url": "/repos/acme/widget/issues/7", "body": "", "created_at": "2026-08-01T23:59:59Z"}
+        )
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    assert GitHub(config, runner=runner).verify_completion(item, WorkerResult.completed("fixed", "new-head", "issue", 44)) is False
+
+
+@pytest.mark.parametrize(
+    "kind,endpoint,link_key,timestamp_key",
+    [
+        ("review", "/repos/acme/widget/pulls/comments/44", "pull_request_url", "created_at"),
+        ("review_summary", "/repos/acme/widget/pulls/7/reviews/44", None, "submitted_at"),
+    ],
+)
+def test_completion_verifies_exact_pr_review_api_shapes(config, kind, endpoint, link_key, timestamp_key):
+    item = ResolvedNotification(
+        Notification("thread-11", "2026-08-02T00:00:00Z", "acme/widget", 7, "PullRequest", "comment", "review", None),
+        PullRequest("acme/widget", 7, "open", False, "new-head", "https://github.com/acme/widget/pull/7", "joelbrilliant"),
+        mutation_allowed=True,
+    )
+
+    def runner(argv, **kwargs):
+        current = argv[-1]
+        if current == "/repos/acme/widget/pulls/7":
+            payload = {"state": "open", "merged_at": None, "head": {"sha": "new-head"}, "html_url": item.pull.url, "user": {"login": "joelbrilliant"}}
+        else:
+            assert current == endpoint
+            payload = {"id": 44, "user": {"login": "joelbrilliant"}, "body": "Fixed and verified.", timestamp_key: "2026-08-02T00:01:00Z"}
+            if link_key:
+                payload[link_key] = "/repos/acme/widget/pulls/7"
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    result = WorkerResult.completed("fixed", "new-head", kind, 44)
+    assert GitHub(config, runner=runner).verify_completion(item, result) is True
+
+
+def test_null_url_checksuite_resolves_through_exact_workflow_run_and_head_ref(config):
+    payload = [{
+        "id": "thread-null-check",
+        "updated_at": "2026-08-02T00:02:00Z",
+        "unread": True,
+        "reason": "ci_activity",
+        "subject": {"type": "CheckSuite", "url": None, "latest_comment_url": None, "title": "CI workflow run failed for fix/widget branch"},
+        "repository": {"full_name": "acme/widget"},
+    }]
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        endpoint = argv[-1]
+        if endpoint.startswith("/notifications?"):
+            response = payload
+        elif endpoint == "/repos/acme/widget/actions/runs?branch=fix%2Fwidget&event=pull_request&status=failure&per_page=100":
+            response = {"workflow_runs": [{
+                "updated_at": "2026-08-02T00:01:30Z",
+                "head_branch": "fix/widget",
+                "head_sha": "failed-head",
+                "head_repository": {"owner": {"login": "joelbrilliant"}},
+            }]}
+        elif endpoint == "/repos/acme/widget/pulls?state=all&head=joelbrilliant%3Afix%2Fwidget&per_page=100":
+            response = [{"number": 7}]
+        elif endpoint == "/repos/acme/widget/pulls/7":
+            response = {"state": "open", "merged_at": None, "head": {"sha": "current-head"}, "html_url": "https://github.com/acme/widget/pull/7", "user": {"login": "joelbrilliant"}}
+        else:
+            raise AssertionError(endpoint)
+        return subprocess.CompletedProcess(argv, 0, json.dumps(response), "")
+
+    github = GitHub(config, runner=runner)
+    item = github.resolve(github.list_notifications(20)[0])
+
+    assert item is not None
+    assert item.pull.number == 7
+    assert item.source_head_sha == "failed-head"
+    assert calls[1][-1].startswith("/repos/acme/widget/actions/runs?")
+
+
+def test_null_url_pull_request_is_retained_for_blocked_handling(config):
+    payload = [{
+        "id": "thread-null-pull",
+        "updated_at": "2026-08-02T00:02:00Z",
+        "unread": True,
+        "reason": "comment",
+        "subject": {"type": "PullRequest", "url": None, "latest_comment_url": None, "title": "Unavailable pull"},
+        "repository": {"full_name": "acme/widget"},
+    }]
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    item = GitHub(config, runner=runner).list_notifications(20)[0]
+
+    assert item.kind == "review"
+    assert item.pull_number is None
+
+
+def test_mark_read_requires_the_same_notification_update(config):
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        payload = {"updated_at": "2026-08-02T00:01:00Z"}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    github = GitHub(config, runner=runner)
+    github.mark_read("thread-1", "2026-08-02T00:01:00Z")
+    with pytest.raises(StaleNotification):
+        github.mark_read("thread-1", "2026-08-02T00:00:00Z")
+
+    assert calls[0][-1] == "/notifications/threads/thread-1"
+    assert calls[1] == ["gh", "api", "--method", "PATCH", "/notifications/threads/thread-1"]
+
+
+def test_green_head_rejects_truncated_commit_statuses(config):
+    item = ResolvedNotification(
+        Notification("thread-check", "2026-08-02T00:00:00Z", "acme/widget", 7, "CheckSuite", "ci_activity", "check", "old-head"),
+        PullRequest("acme/widget", 7, "open", False, "new-head", "https://github.com/acme/widget/pull/7", "joelbrilliant"),
+    )
+
+    def runner(argv, **kwargs):
+        payload = (
+            {"total_count": 1, "check_runs": [{"status": "completed", "conclusion": "success"}]}
+            if "check-runs" in argv[-1]
+            else {"state": "success", "total_count": 2, "statuses": [{"state": "success"}]}
+        )
+        return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+    assert GitHub(config, runner=runner).head_is_green(item) is False
 
 
 def test_joel_authored_upstream_pr_is_supported_without_an_allowed_base_namespace(config):

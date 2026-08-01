@@ -6,7 +6,7 @@
   <string>com.joelbrilliant.github-watch</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/github-watch</string>
+    <string>/Users/openclaw/.local/bin/github-watch</string>
     <string>--config</string>
     <string>/Users/openclaw/.config/github-watch/config.json</string>
     <string>run</string>
@@ -15,8 +15,6 @@
   <integer>10800</integer>
   <key>RunAtLoad</key>
   <false/>
-  <key>Disabled</key>
-  <true/>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>

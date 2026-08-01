@@ -6,4 +6,4 @@ if [ "$#" -ne 1 ]; then
 fi
 
 export HERMES_HOME=/Users/openclaw/.hermes/profiles/oscar
-exec hermes --oneshot "$1"
+exec /Users/openclaw/.local/bin/hermes --oneshot "$1"

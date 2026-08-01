@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
 import subprocess
 import tempfile
@@ -16,8 +15,6 @@ from typing import Callable
 
 from .config import Config
 from .github import ResolvedNotification
-
-
 @dataclass(frozen=True)
 class WorkerResult:
     outcome: str
@@ -27,24 +24,17 @@ class WorkerResult:
     comment_id: int | None = None
     blocker: str | None = None
     proposed_fix: str | None = None
-
     @classmethod
     def no_action(cls, summary: str) -> "WorkerResult":
         return cls("no_action", summary=summary)
-
     @classmethod
     def completed(cls, summary: str, head_sha: str, comment_kind: str, comment_id: int) -> "WorkerResult":
         return cls("completed", summary, head_sha, comment_kind, comment_id)
-
     @classmethod
     def blocked(cls, blocker: str, proposed_fix: str) -> "WorkerResult":
         return cls("blocked", blocker=blocker, proposed_fix=proposed_fix)
-
-
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 ProcessFactory = Callable[..., subprocess.Popen[str]]
-
-
 class OscarWorker:
     """Clones an exact head, runs one session, then removes its worktree."""
 
@@ -67,26 +57,31 @@ class OscarWorker:
     def run(self, item: ResolvedNotification) -> WorkerResult:
         if self._is_gui_command(self.config.oscar_command):
             return WorkerResult.blocked("Oscar command is a GUI executable", "configure a headless Oscar executable")
-        worktree = None
         try:
             self.config.worktree_root.mkdir(parents=True, exist_ok=True)
-            worktree = Path(tempfile.mkdtemp(prefix="github-watch-", dir=self.config.worktree_root))
-            self._clone(item, worktree)
-            return self._launch(worktree, item, self._prompt(item))
+            with tempfile.TemporaryDirectory(prefix="github-watch-", dir=self.config.worktree_root) as location:
+                runtime = Path(location)
+                worktree = runtime / "repo"
+                environment = self._environment(runtime, item.mutation_allowed)
+                clone_environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"}
+                self._clone(item, worktree, clone_environment, environment)
+                return self._launch(worktree, item, self._prompt(item), environment)
         except (OSError, subprocess.SubprocessError, ValueError):
             return WorkerResult.blocked("Oscar could not start", "inspect GitHub access and the headless Oscar command")
-        finally:
-            if worktree is not None:
-                shutil.rmtree(worktree, ignore_errors=True)
 
-    def _clone(self, item: ResolvedNotification, worktree: Path) -> None:
+    def _clone(self, item: ResolvedNotification, worktree: Path, clone_env: dict[str, str], worktree_env: dict[str, str]) -> None:
         repository = item.pull.repository
-        self._command(["git", "clone", "--quiet", "--no-checkout", f"https://github.com/{repository}.git", str(worktree)])
-        self._command(["git", "-C", str(worktree), "checkout", "--detach", item.pull.head_sha])
+        self._command(["git", "clone", "--quiet", "--no-checkout", f"https://github.com/{repository}.git", str(worktree)], clone_env)
+        pull_ref = f"refs/pull/{item.pull.number}/head"
+        self._command(["git", "-C", str(worktree), "fetch", "--quiet", "origin", pull_ref], clone_env)
+        fetched = self._command(["git", "-C", str(worktree), "rev-parse", "FETCH_HEAD"], worktree_env).stdout.strip()
+        if fetched != item.pull.head_sha:
+            raise ValueError("pull ref changed before checkout")
+        self._command(["git", "-C", str(worktree), "checkout", "--detach", fetched], worktree_env)
 
-    def _launch(self, worktree: Path, item: ResolvedNotification, prompt: str) -> WorkerResult:
-        environment = self._environment(worktree, item.mutation_allowed)
-        with resources.as_file(resources.files("github_watch").joinpath("templates/oscar-headless.sb")) as profile:
+    def _launch(self, worktree: Path, item: ResolvedNotification, prompt: str, environment: dict[str, str]) -> WorkerResult:
+        sandbox = "oscar-headless.sb" if item.mutation_allowed else "oscar-readonly.sb"
+        with resources.as_file(resources.files("github_watch").joinpath(f"templates/{sandbox}")) as profile:
             argv = [
                 "/usr/bin/sandbox-exec",
                 "-f",
@@ -109,21 +104,25 @@ class OscarWorker:
             while exit_code is None:
                 gui = self.gui_scan(process.pid)
                 if gui:
-                    self._terminate_group(process.pid)
+                    self._terminate_group(process)
                     return WorkerResult.blocked(f"GUI executable observed: {Path(gui).name}", "inspect the Oscar command before retrying")
                 if self.clock() >= started + self.config.oscar_timeout_seconds:
-                    self._terminate_group(process.pid)
+                    self._terminate_group(process)
                     return WorkerResult.blocked("Oscar timed out", "inspect the pull request and retry the bounded session")
                 self.sleep(0.05)
                 exit_code = process.poll()
             stdout, _ = process.communicate()
+            if self._group_exists(process.pid):
+                self._terminate_group(process)
+                return WorkerResult.blocked("Oscar left a background process", "inspect the bounded Oscar command before retrying")
         if exit_code != 0:
             return WorkerResult.blocked("Oscar exited without a terminal result", "inspect the bounded Oscar session and retry")
         return self._result(stdout)
 
     @staticmethod
     def _environment(worktree: Path, mutation_allowed: bool) -> dict[str, str]:
-        environment = os.environ.copy()
+        retained = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TMPDIR")
+        environment = {key: os.environ[key] for key in retained if os.environ.get(key)}
         environment["CI"] = "1"
         for key in ("DISPLAY", "WAYLAND_DISPLAY", "MIR_SOCKET", "XDG_SESSION_TYPE"):
             environment.pop(key, None)
@@ -132,7 +131,10 @@ class OscarWorker:
                 environment.pop(key, None)
             gh_config = worktree / ".github-watch-empty-gh"
             gh_config.mkdir()
+            isolated_home = worktree / ".github-watch-home"
+            isolated_home.mkdir()
             environment.update(
+                HOME=str(isolated_home),
                 GH_CONFIG_DIR=str(gh_config),
                 GIT_CONFIG_NOSYSTEM="1",
                 GIT_CONFIG_GLOBAL=os.devnull,
@@ -144,8 +146,8 @@ class OscarWorker:
             )
         return environment
 
-    def _command(self, argv: list[str]) -> None:
-        self.runner(argv, check=True, capture_output=True, text=True, shell=False)
+    def _command(self, argv: list[str], environment: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return self.runner(argv, check=True, capture_output=True, text=True, shell=False, env=environment)
 
     @staticmethod
     def _prompt(item: ResolvedNotification) -> str:
@@ -221,16 +223,28 @@ class OscarWorker:
         return command == "/usr/bin/open" or command.startswith("/usr/bin/open ") or ".app/Contents/MacOS/" in command
 
     @staticmethod
-    def _terminate_group(process_group: int) -> None:
+    def _group_exists(process_group: int) -> bool:
         try:
-            os.killpg(process_group, signal.SIGTERM)
+            os.killpg(process_group, 0)
         except OSError:
-            pass
+            return False
+        return True
 
+    @classmethod
+    def _terminate_group(cls, process: subprocess.Popen[str]) -> None:
+        for stop_signal in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, stop_signal)
+            except OSError:
+                return
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            if not cls._group_exists(process.pid):
+                return
 
 def _short_text(value: object) -> bool:
     return isinstance(value, str) and 0 < len(value) <= 500 and "\x00" not in value
-
-
 def _context(value: str | None) -> str | None:
     return value[:4000] if isinstance(value, str) else None

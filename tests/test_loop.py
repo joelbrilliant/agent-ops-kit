@@ -61,6 +61,57 @@ def test_current_review_or_failed_check_launches_exactly_one_oscar_session(confi
     assert buzz.messages == []
 
 
+def test_ambiguous_supported_notification_is_blocked_once_and_remains_unread(config):
+    item = note(kind="check")
+    github = FakeGitHub([item], {})
+    worker = FakeWorker()
+    buzz = FakeBuzz()
+    store = StateStore(config.state_dir)
+    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+
+    loop.run()
+    loop.run()
+
+    row = store.get(item.notification_id, item.updated_at)
+    assert row.outcome == "blocked"
+    assert row.pull_number == 0
+    assert row.read_completed is False
+    assert row.buzz_completed is True
+    assert worker.calls == []
+    assert len(buzz.messages) == 1
+    assert "could not be resolved safely" in buzz.messages[0]
+
+
+def test_resolution_failure_is_deduplicated_blocked_work(config):
+    item = note(kind="check")
+    github = FakeGitHub([item], {})
+    github.resolve = lambda _: (_ for _ in ()).throw(RuntimeError("read failed"))
+    worker = FakeWorker()
+    buzz = FakeBuzz()
+    store = StateStore(config.state_dir)
+    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+
+    loop.run()
+    loop.run()
+
+    assert store.get(item.notification_id, item.updated_at).outcome == "blocked"
+    assert len(buzz.messages) == 1
+    assert worker.calls == []
+
+
+def test_green_check_proof_failure_routes_to_oscar(config):
+    item = note(kind="check")
+    item = item.__class__(**{**item.__dict__, "source_head_sha": "old-head"})
+    github = FakeGitHub([item], {item.notification_id: resolved(item, head_sha="new-head")})
+    github.head_is_green = lambda _: (_ for _ in ()).throw(RuntimeError("read failed"))
+    worker = FakeWorker(WorkerResult.no_action("inspected live state"))
+    buzz = FakeBuzz()
+
+    run_loop(config, github, worker, buzz)
+
+    assert worker.calls == [item.notification_id]
+
+
 def test_valid_no_action_marks_read_and_sends_no_buzz(config):
     item = note()
     github = FakeGitHub([item], {item.notification_id: resolved(item)})
@@ -124,20 +175,20 @@ def test_non_owned_completed_result_is_rejected_before_remote_verification(confi
     assert "read-only triage" in buzz.messages[0]
 
 
-def test_missing_latest_comment_context_blocks_read_only_triage_before_oscar(config):
+def test_missing_latest_comment_context_still_reaches_read_only_oscar(config):
     item = note()
     item = item.__class__(**{**item.__dict__, "latest_comment_url": "/repos/acme/widget/issues/comments/4"})
     github = FakeGitHub([item], {item.notification_id: resolved(item, mutation_allowed=False)})
-    worker = FakeWorker()
+    worker = FakeWorker(WorkerResult.no_action("live pull needs no action"))
     buzz = FakeBuzz()
 
     _, store = run_loop(config, github, worker, buzz)
 
     row = store.get(item.notification_id, item.updated_at)
-    assert worker.calls == []
-    assert row.outcome == "blocked"
-    assert row.read_completed is False
-    assert "latest GitHub comment context" in buzz.messages[0]
+    assert worker.calls == [item.notification_id]
+    assert row.outcome == "no_action"
+    assert row.read_completed is True
+    assert buzz.messages == []
 
 
 def test_completed_is_blocked_until_remote_head_and_comment_verify(config):
@@ -212,6 +263,38 @@ def test_repeated_same_notification_update_does_not_repeat_actions(config):
     assert [call for call in github.calls if call[0] == "mark"] == [("mark", item.notification_id)]
     assert github.calls == first_calls + [("list", str(config.batch_limit)), ("resolve", item.notification_id)]
     assert buzz.messages == []
+
+
+def test_same_notification_update_with_changed_head_does_not_repeat_actions(config):
+    item = note()
+    github = FakeGitHub([item], {item.notification_id: resolved(item)})
+    worker = FakeWorker(WorkerResult.blocked("manual check", "inspect the pull request"))
+    buzz = FakeBuzz()
+    store = StateStore(config.state_dir)
+    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+
+    loop.run()
+    github.resolutions[item.notification_id] = resolved(item, head_sha="new-head")
+    loop.run()
+
+    assert worker.calls == [item.notification_id]
+    assert len(buzz.messages) == 1
+
+
+def test_changed_notification_before_mark_read_supersedes_old_effects(config):
+    item = note()
+    github = FakeGitHub([item], {item.notification_id: resolved(item)})
+    github.mark_stale = True
+    worker = FakeWorker(WorkerResult.completed("fixed formatter", "head-2", "issue", 44))
+    buzz = FakeBuzz()
+
+    _, store = run_loop(config, github, worker, buzz)
+
+    row = store.get(item.notification_id, item.updated_at)
+    assert row.read_completed is True
+    assert row.buzz_completed is True
+    assert row.last_error == "superseded before mark-read"
+    assert buzz.messages == ["Oscar completed acme/widget#7: fixed formatter. https://github.com/acme/widget/pull/7"]
 
 
 def test_failed_mark_read_retries_only_mark_read(config):

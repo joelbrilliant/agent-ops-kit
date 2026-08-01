@@ -1,0 +1,38 @@
+# Local operator config and state (never commit)
+agent-ops.config.json
+agent-ops.local.json
+.config/
+.state/
+.agent-ops/
+*.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Worktrees and clones managed by agent-ops
+workspaces/
+.worktrees/
+
+# Receipts may live outside repo; ignore accidental local dumps
+receipts/
+*.receipt.json

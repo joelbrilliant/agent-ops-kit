@@ -1,0 +1,49 @@
+{
+  "operator_logins": ["YOUR_GITHUB_LOGIN"],
+  "owned_namespaces": ["YOUR_GITHUB_LOGIN"],
+  "excluded_repositories": [],
+  "trusted_reviewer_logins": ["copilot-pull-request-reviewer"],
+  "workspace_root": "/absolute/path/to/agent-ops-workspace",
+  "state_dir": "/absolute/path/to/agent-ops-state",
+  "protected_path_patterns": [
+    ".github/workflows/*",
+    "**/credentials*",
+    "**/.env*",
+    "secrets/*"
+  ],
+  "classifier_command": [
+    "python3",
+    "/absolute/path/to/your-classifier.py",
+    "--request",
+    "{request_path}",
+    "--response",
+    "{response_path}"
+  ],
+  "builder_command": [
+    "python3",
+    "/absolute/path/to/your-builder.py",
+    "--request",
+    "{request_path}",
+    "--response",
+    "{response_path}",
+    "--worktree",
+    "{worktree_path}"
+  ],
+  "reviewer_command": [
+    "python3",
+    "/absolute/path/to/your-reviewer.py",
+    "--request",
+    "{request_path}",
+    "--response",
+    "{response_path}",
+    "--worktree",
+    "{worktree_path}"
+  ],
+  "notification_mode": "concise",
+  "default_verification_commands": {
+    "unit": ["python3", "-m", "pytest", "-q"]
+  },
+  "repository_policies": {},
+  "reclaim_after_seconds": 21600,
+  "runner_timeout_seconds": 3600
+}

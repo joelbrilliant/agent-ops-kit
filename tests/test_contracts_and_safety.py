@@ -133,6 +133,12 @@ def test_load_config_roundtrip(tmp_path: Path):
                 },
                 "notification_mode": "quiet",
                 "default_verification_commands": {"unit": ["true"]},
+                "repository_policies": {
+                    "Example-User/Repo": {
+                        "permitted_paths": ["src/*"],
+                        "verification_commands": {},
+                    }
+                },
             }
         ),
         encoding="utf-8",
@@ -140,6 +146,7 @@ def test_load_config_roundtrip(tmp_path: Path):
     cfg = load_config(cfg_path)
     assert cfg.operator_logins == ["operator"]
     assert cfg.default_verification_commands["unit"] == ["true"]
+    assert cfg.policy_for("EXAMPLE-USER/REPO") is not None
 
     optional = json.loads(cfg_path.read_text(encoding="utf-8"))
     optional.pop("excluded_repositories")

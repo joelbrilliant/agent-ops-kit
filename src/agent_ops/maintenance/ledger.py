@@ -124,11 +124,25 @@ class Ledger:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    def _secure_database_files(self) -> None:
+        for path in (
+            self.db_path,
+            Path(str(self.db_path) + "-wal"),
+            Path(str(self.db_path) + "-shm"),
+        ):
+            if not path.exists():
+                continue
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=30, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA foreign_keys=ON")
+        self._secure_database_files()
         return conn
 
     def _init_db(self) -> None:
@@ -161,6 +175,7 @@ class Ledger:
                         conn.execute(
                             "ALTER TABLE notifications ADD COLUMN last_error TEXT"
                         )
+                    self._secure_database_files()
                 return
             except sqlite3.OperationalError as exc:
                 if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
@@ -181,6 +196,7 @@ class Ledger:
                 pass
             raise
         finally:
+            self._secure_database_files()
             conn.close()
 
     def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:

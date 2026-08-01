@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import stat
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict
 
 from agent_ops.maintenance.ledger import Ledger, make_claim_key
+
+
+def test_ledger_files_are_owner_only(tmp_path: Path) -> None:
+    database = tmp_path / "l.sqlite3"
+    ledger = Ledger(database)
+    ledger.set_meta("probe", "1")
+
+    assert stat.S_IMODE(database.stat().st_mode) == 0o600
+    for suffix in ("-wal", "-shm"):
+        path = Path(str(database) + suffix)
+        if path.exists():
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_claim_key_stable():

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from agent_ops.config import RunnerIdentityPolicy, expand_runner_argv
-from agent_ops.contracts import DecisionV1, TaskSpecV1
+from agent_ops.contracts import DecisionV1, NotifyTriageDecisionV1, TaskSpecV1
 from agent_ops.github.client import GitHubClient
 from agent_ops.process import ProcResult, RunnerError, run_argv
 
@@ -527,6 +527,72 @@ def _digest(text: str) -> str:
     import hashlib
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class NotifyTriageRunnerResult:
+    decision: NotifyTriageDecisionV1
+    identity: RunnerIdentity
+
+
+def run_notify_triage(
+    command_template: Sequence[str],
+    *,
+    request_payload: Dict[str, Any],
+    state_dir: Path,
+    run_id: str,
+    required_identity: RunnerIdentityPolicy,
+    runner_environment: Mapping[str, str],
+    timeout: int = 3600,
+) -> NotifyTriageRunnerResult:
+    req = state_dir / "requests" / f"{run_id}-notify-triage-request.json"
+    resp = state_dir / "requests" / f"{run_id}-notify-triage-response.json"
+    if resp.exists():
+        resp.unlink()
+    write_owner_only_json(req, request_payload)
+    result = run_runner(
+        command_template,
+        request_path=req,
+        response_path=resp,
+        timeout=timeout,
+        env=runner_environment,
+    )
+    if not result.ok:
+        raise RunnerContractError(f"notify_triage_failed:{result.returncode}")
+    data = _read_response(
+        resp,
+        "NotifyTriageResponseV1",
+        ("schema", "decision", "runner_identity"),
+    )
+    decision_data = data.get("decision")
+    if not isinstance(decision_data, dict):
+        raise RunnerContractError("notify_triage_decision_invalid_shape")
+    _require_exact_keys(
+        decision_data,
+        (
+            "schema",
+            "decision",
+            "reason",
+            "joel_summary",
+            "mark_read",
+            "related_repository",
+            "related_pr_number",
+            "related_url",
+        ),
+        "NotifyTriageDecisionV1",
+    )
+    if decision_data.get("schema") != "NotifyTriageDecisionV1":
+        raise RunnerContractError("notify_triage_decision_schema_mismatch")
+    decision = NotifyTriageDecisionV1.from_dict(decision_data)
+    if decision.decision not in {"NO_ACTION", "ACTION_FIX", "NEEDS_JOEL"}:
+        raise RunnerContractError("notify_triage_decision_invalid_value")
+    if not isinstance(decision.reason, str) or not decision.reason.strip():
+        raise RunnerContractError("notify_triage_reason_missing")
+    if decision.decision == "NEEDS_JOEL" and not str(decision.joel_summary or "").strip():
+        raise RunnerContractError("notify_triage_joel_summary_missing")
+    identity = _identity_from_dict(data.get("runner_identity"))
+    validate_runner_identity(identity, required_identity, fresh_session=True)
+    return NotifyTriageRunnerResult(decision=decision, identity=identity)
 
 
 def heuristic_decision_from_body(body: str, path: str) -> DecisionV1:

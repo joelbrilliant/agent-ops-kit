@@ -212,6 +212,51 @@ class EvidenceBundleV1:
         }
 
 
+@dataclass
+class NotifyTriageDecisionV1:
+    """Front-door decision for one GitHub notification.
+
+    NO_ACTION: dismiss silently (Joel paste workflow: "no action required").
+    ACTION_FIX: hand to the existing PR fix loop when an actionable signal exists.
+    NEEDS_JOEL: ping Joel in the configured exception channel only.
+    """
+
+    decision: str
+    reason: str
+    joel_summary: str = ""
+    mark_read: bool = True
+    related_repository: str = ""
+    related_pr_number: int = 0
+    related_url: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema": "NotifyTriageDecisionV1",
+            "decision": self.decision,
+            "reason": self.reason,
+            "joel_summary": self.joel_summary,
+            "mark_read": self.mark_read,
+            "related_repository": self.related_repository,
+            "related_pr_number": self.related_pr_number,
+            "related_url": self.related_url,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "NotifyTriageDecisionV1":
+        decision = str(data.get("decision", "NEEDS_JOEL")).upper()
+        if decision not in {"NO_ACTION", "ACTION_FIX", "NEEDS_JOEL"}:
+            decision = "NEEDS_JOEL"
+        return cls(
+            decision=decision,
+            reason=str(data.get("reason", "invalid triage decision")),
+            joel_summary=str(data.get("joel_summary", "") or ""),
+            mark_read=bool(data.get("mark_read", True)),
+            related_repository=str(data.get("related_repository", "") or ""),
+            related_pr_number=int(data.get("related_pr_number", 0) or 0),
+            related_url=str(data.get("related_url", "") or ""),
+        )
+
+
 def dumps_json(obj: Any) -> str:
     if hasattr(obj, "to_dict"):
         payload = obj.to_dict()

@@ -14,6 +14,10 @@ from agent_ops.config import ConfigError, load_config
 from agent_ops.exit_codes import HELD, OK, USAGE_OR_TOOLING
 from agent_ops.github.client import GitHubError
 from agent_ops.maintenance.ledger import Ledger
+from agent_ops.maintenance.notify_triage import (
+    inspect_notifications,
+    triage_notifications,
+)
 from agent_ops.maintenance.orchestrator import (
     inspect_work,
     is_paused,
@@ -71,6 +75,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_config(p_clear)
 
+    p_notify = pr_sub.add_parser(
+        "notify-triage",
+        help="Front-door GitHub notification triage (NO_ACTION / ACTION_FIX / NEEDS_JOEL)",
+    )
+    add_config(p_notify)
+    p_notify.add_argument(
+        "--inspect-only",
+        action="store_true",
+        help="Classify without marking read, sweeping, or pinging Joel",
+    )
+    p_notify.add_argument(
+        "--no-fix-sweep",
+        action="store_true",
+        help="Do not run the PR fix sweep even when ACTION_FIX is found",
+    )
+
     return parser
 
 
@@ -89,7 +109,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return USAGE_OR_TOOLING
 
     tool_err = _require_tools(config.gh_command, config.git_command)
-    if tool_err and args.pr_command in ("sweep", "inspect"):
+    if tool_err and args.pr_command in ("sweep", "inspect", "notify-triage"):
         sys.stderr.write(f"tooling error: {tool_err}\n")
         return USAGE_OR_TOOLING
 
@@ -138,9 +158,36 @@ def main(argv: Optional[List[str]] = None) -> int:
         sys.stdout.write("circuit_cleared\n")
         return OK
 
+    if args.pr_command == "notify-triage":
+        try:
+            if args.inspect_only:
+                outcome = inspect_notifications(config)
+            else:
+                outcome = triage_notifications(
+                    config,
+                    run_fix_sweep=not args.no_fix_sweep
+                    and config.notification_triage.run_fix_sweep_on_action,
+                )
+        except (GitHubError, RunnerError, OSError, ValueError) as exc:
+            detail = redact_text(str(exc) or exc.__class__.__name__, config.private_markers)
+            sys.stderr.write(f"notify-triage error: {detail}\n")
+            return HELD
+        if config.notification_mode == "verbose" or outcome.message not in (
+            "notify_triage_complete",
+            "notify_triage_disabled",
+            "paused_notify_inspect_only",
+        ):
+            _print_json(outcome.to_dict())
+        elif outcome.needs_joel or outcome.acted_fix or outcome.dismissed:
+            sys.stdout.write(
+                f"{outcome.message};dismissed:{outcome.dismissed};"
+                f"acted:{outcome.acted_fix};needs_joel:{outcome.needs_joel};"
+                f"notified:{outcome.notified_joel}\n"
+            )
+        return outcome.exit_code
+
     if args.pr_command == "sweep":
         outcome = sweep(config)
-        # Operator visibility: silent for no work; concise otherwise
         if outcome.message in (
             "no_actionable_signal",
             "paused_inspect_only",

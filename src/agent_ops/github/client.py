@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
+from urllib.parse import quote, urlencode
 
 from agent_ops.process import ProcResult, run_argv
 
@@ -29,6 +30,19 @@ class GitHubClient(Protocol):
     def required_checks(self, repository: str, pr_number: int) -> List[Dict[str, Any]]:
         ...
 
+    def list_notifications(
+        self,
+        *,
+        all_notifications: bool = False,
+        participating: bool = True,
+        per_page: int = 50,
+        page: int = 1,
+    ) -> List[Dict[str, Any]]:
+        ...
+
+    def mark_notification_read(self, thread_id: str) -> None:
+        ...
+
 
 @dataclass
 class GhClient:
@@ -41,10 +55,6 @@ class GhClient:
         return result
 
     def rest_search_issues(self, query: str, page: int = 1, per_page: int = 100) -> Dict[str, Any]:
-        # gh api accepts query params as field flags - pass path with encoded query carefully
-        # Use -f for form; for GET search use path only.
-        from urllib.parse import quote
-
         path = f"search/issues?q={quote(query)}&per_page={per_page}&page={page}"
         result = self._run(["api", path])
         return json.loads(result.stdout)
@@ -61,6 +71,13 @@ class GhClient:
         return data
 
     def rest_get(self, path: str) -> Dict[str, Any]:
+        result = self._run(["api", path])
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict):
+            raise GitHubError("rest_get expected object")
+        return data
+
+    def rest_get_any(self, path: str) -> Any:
         result = self._run(["api", path])
         return json.loads(result.stdout)
 
@@ -90,7 +107,7 @@ class GhClient:
         try:
             rows = json.loads(result.stdout or "[]")
         except json.JSONDecodeError as exc:
-            raise GitHubError("required checks returned invalid JSON") from exc
+            raise GitHubError("required checks returned invalid shape") from exc
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             raise GitHubError("required checks returned invalid shape")
         if not result.ok and not rows:
@@ -98,6 +115,44 @@ class GhClient:
             if "no required checks" not in message:
                 raise GitHubError("required checks query failed")
         return [dict(row) for row in rows]
+
+    def list_notifications(
+        self,
+        *,
+        all_notifications: bool = False,
+        participating: bool = True,
+        per_page: int = 50,
+        page: int = 1,
+    ) -> List[Dict[str, Any]]:
+        query = urlencode(
+            {
+                "all": "true" if all_notifications else "false",
+                "participating": "true" if participating else "false",
+                "per_page": str(per_page),
+                "page": str(page),
+            }
+        )
+        result = self._run(["api", f"notifications?{query}"])
+        data = json.loads(result.stdout or "[]")
+        if not isinstance(data, list):
+            raise GitHubError("notifications returned invalid shape")
+        return [dict(item) for item in data if isinstance(item, dict)]
+
+    def mark_notification_read(self, thread_id: str) -> None:
+        result = run_argv(
+            [
+                self.gh_command,
+                "api",
+                "-X",
+                "PATCH",
+                f"notifications/threads/{thread_id}",
+                "--silent",
+            ],
+            timeout=60,
+            check=False,
+        )
+        if not result.ok:
+            raise GitHubError(result.stderr.strip() or "mark notification read failed")
 
 
 class FakeGitHub:
@@ -114,10 +169,11 @@ class FakeGitHub:
         self.replies: List[Dict[str, Any]] = []
         self.mutations: List[Dict[str, Any]] = []
         self.required_check_rows: Dict[str, Any] = {}
+        self.notifications: List[Dict[str, Any]] = []
+        self.marked_read: List[str] = []
 
     def rest_search_issues(self, query: str, page: int = 1, per_page: int = 100) -> Dict[str, Any]:
         pages: List[List[Dict[str, Any]]] = self.search_pages.get(query, [])
-        # Exact key only - avoid cross-query contamination between author/user searches
         if page < 1 or page > len(pages):
             return {"total_count": 0, "incomplete_results": False, "items": []}
         items = pages[page - 1]
@@ -136,11 +192,26 @@ class FakeGitHub:
         if path in self.rest_handlers:
             val = self.rest_handlers[path]
             out = val() if callable(val) else val
-            return dict(out)  # type: ignore[arg-type]
+            if not isinstance(out, dict):
+                raise GitHubError(f"rest_get expected object for {path}")
+            return dict(out)
         for key, val in self.rest_handlers.items():
             if key in path:
                 out = val() if callable(val) else val
-                return dict(out)  # type: ignore[arg-type]
+                if not isinstance(out, dict):
+                    raise GitHubError(f"rest_get expected object for {path}")
+                return dict(out)
+        raise GitHubError(f"no fake rest handler for {path}")
+
+    def rest_get_any(self, path: str) -> Any:
+        if path in self.rest_handlers:
+            val = self.rest_handlers[path]
+            out = val() if callable(val) else val
+            return out
+        for key, val in self.rest_handlers.items():
+            if key in path:
+                out = val() if callable(val) else val
+                return out
         raise GitHubError(f"no fake rest handler for {path}")
 
     def viewer_login(self) -> str:
@@ -154,3 +225,17 @@ class FakeGitHub:
         )
         rows = value() if callable(value) else value
         return [dict(row) for row in rows]
+
+    def list_notifications(
+        self,
+        *,
+        all_notifications: bool = False,
+        participating: bool = True,
+        per_page: int = 50,
+        page: int = 1,
+    ) -> List[Dict[str, Any]]:
+        del all_notifications, participating, per_page, page
+        return [dict(item) for item in self.notifications]
+
+    def mark_notification_read(self, thread_id: str) -> None:
+        self.marked_read.append(str(thread_id))

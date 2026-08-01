@@ -37,6 +37,21 @@ class RunnerIdentityPolicy:
 
 
 @dataclass(frozen=True)
+class NotificationTriagePolicy:
+    """Front-door GitHub notification triage (paste-workflow automation)."""
+
+    enabled: bool = True
+    participating_only: bool = False
+    include_read: bool = False
+    mark_read_on_no_action: bool = True
+    mark_read_on_action: bool = True
+    mark_read_on_needs_joel: bool = False
+    max_per_run: int = 40
+    run_fix_sweep_on_action: bool = True
+    needs_joel_command: List[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class Config:
     operator_logins: List[str]
     owned_namespaces: List[str]
@@ -61,6 +76,7 @@ class Config:
     gh_command: str = "gh"
     git_command: str = "git"
     trusted_reviewer_associations: List[str] = field(default_factory=list)
+    notification_triage: NotificationTriagePolicy = field(default_factory=NotificationTriagePolicy)
 
     def is_excluded(self, repository: str) -> bool:
         repo = repository.lower()
@@ -171,6 +187,63 @@ def _environment_allowlist(raw: Any) -> List[str]:
     return names
 
 
+
+def _parse_notification_triage(raw: Any) -> NotificationTriagePolicy:
+    if raw is None:
+        return NotificationTriagePolicy()
+    if not isinstance(raw, dict):
+        raise ConfigError("notification_triage must be an object")
+    allowed = {
+        "enabled",
+        "participating_only",
+        "include_read",
+        "mark_read_on_no_action",
+        "mark_read_on_action",
+        "mark_read_on_needs_joel",
+        "max_per_run",
+        "run_fix_sweep_on_action",
+        "needs_joel_command",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ConfigError("unknown notification_triage keys: " + ",".join(unknown))
+
+    def _bool(key: str, default: bool) -> bool:
+        if key not in raw:
+            return default
+        value = raw[key]
+        if not isinstance(value, bool):
+            raise ConfigError(f"notification_triage.{key} must be a boolean")
+        return value
+
+    max_per_run = int(raw.get("max_per_run", 40))
+    if max_per_run < 1 or max_per_run > 200:
+        raise ConfigError("notification_triage.max_per_run must be 1..200")
+
+    command: List[str] = []
+    if "needs_joel_command" in raw and raw.get("needs_joel_command") is not None:
+        value = raw["needs_joel_command"]
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ConfigError("notification_triage.needs_joel_command must be an array of strings")
+        command = list(value)
+        if command and "{message}" not in "\n".join(command):
+            raise ConfigError(
+                "notification_triage.needs_joel_command must include {message} placeholder"
+            )
+
+    return NotificationTriagePolicy(
+        enabled=_bool("enabled", True),
+        participating_only=_bool("participating_only", False),
+        include_read=_bool("include_read", False),
+        mark_read_on_no_action=_bool("mark_read_on_no_action", True),
+        mark_read_on_action=_bool("mark_read_on_action", True),
+        mark_read_on_needs_joel=_bool("mark_read_on_needs_joel", False),
+        max_per_run=max_per_run,
+        run_fix_sweep_on_action=_bool("run_fix_sweep_on_action", True),
+        needs_joel_command=command,
+    )
+
+
 def load_config(path: Union[str, Path]) -> Config:
     cfg_path = Path(path).expanduser().resolve()
     if not cfg_path.is_file():
@@ -197,6 +270,7 @@ def load_config(path: Union[str, Path]) -> Config:
         "required_runner_identity",
         "capability_isolation",
         "notification_mode",
+        "notification_triage",
         "default_verification_commands",
         "repository_policies",
         "pause_file_name",
@@ -296,6 +370,8 @@ def load_config(path: Union[str, Path]) -> Config:
     if notification_mode not in ("quiet", "concise", "verbose"):
         raise ConfigError("notification_mode must be quiet|concise|verbose")
 
+    notification_triage = _parse_notification_triage(data.get("notification_triage"))
+
     default_verification = _parse_verification_map(
         data.get("default_verification_commands", {}), "default_verification_commands"
     )
@@ -359,6 +435,7 @@ def load_config(path: Union[str, Path]) -> Config:
         gh_command=str(data.get("gh_command", "gh")),
         git_command=str(data.get("git_command", "git")),
         trusted_reviewer_associations=associations,
+        notification_triage=notification_triage,
     )
 
 

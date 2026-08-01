@@ -49,6 +49,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_job ON jobs(status) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS notifications (
+  thread_id TEXT PRIMARY KEY,
+  decision TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  repository TEXT,
+  pr_number INTEGER,
+  related_url TEXT,
+  joel_summary TEXT,
+  status TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  recorded_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_recorded ON notifications(recorded_at);
 """
 
 
@@ -467,3 +482,76 @@ class Ledger:
         if not row:
             return False
         return row.status in ("completed", "held", "claimed", "running", "failed")
+
+
+    def is_notification_processed(self, notification_id: str) -> bool:
+        return self.get_notification(notification_id) is not None
+
+    def get_notification(self, thread_id: str):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM notifications WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "thread_id": row["thread_id"],
+                "decision": row["decision"],
+                "reason": row["reason"],
+                "updated_at": row["updated_at"],
+                "related_repository": row["repository"] or "",
+                "related_pr_number": int(row["pr_number"] or 0),
+                "related_url": row["related_url"] or "",
+                "joel_summary": row["joel_summary"] or "",
+                "status": row["status"],
+                "schema": "NotifyTriageDecisionV1",
+                "mark_read": False,
+            }
+
+    def record_notification(
+        self,
+        *,
+        thread_id: str,
+        decision: str,
+        reason: str,
+        updated_at: str,
+        repository: str = "",
+        pr_number: int = 0,
+        related_url: str = "",
+        joel_summary: str = "",
+        status: str = "processed",
+    ) -> None:
+        now = time.time()
+        with self._tx() as conn:
+            conn.execute(
+                """
+                INSERT INTO notifications(
+                  thread_id, decision, reason, updated_at, repository, pr_number,
+                  related_url, joel_summary, status, created_at, recorded_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                  decision=excluded.decision,
+                  reason=excluded.reason,
+                  updated_at=excluded.updated_at,
+                  repository=excluded.repository,
+                  pr_number=excluded.pr_number,
+                  related_url=excluded.related_url,
+                  joel_summary=excluded.joel_summary,
+                  status=excluded.status,
+                  recorded_at=excluded.recorded_at
+                """,
+                (
+                    thread_id,
+                    decision,
+                    reason,
+                    updated_at or "",
+                    repository or None,
+                    int(pr_number or 0) or None,
+                    related_url or None,
+                    joel_summary or None,
+                    status,
+                    now,
+                    now,
+                ),
+            )

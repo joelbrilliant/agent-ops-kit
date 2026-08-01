@@ -879,16 +879,6 @@ def test_issue_job_holds_when_label_removed_before_push(tmp_path: Path):
     assert not fake.created_pulls
 
 
-def test_push_head_no_force_source_has_no_force_flags(tmp_path: Path):
-    # push_head_no_force never passes --force; unit-level regression via source.
-    from agent_ops.maintenance import worktree as wt_mod
-    import inspect
-
-    src = inspect.getsource(wt_mod.push_head_no_force)
-    assert "--force" not in src
-    assert "force" not in src.lower().split("push")[-1] or "no_force" in src
-
-
 def test_issue_receipt_contains_no_raw_issue_or_private_path(tmp_path: Path):
     cfg = make_issue_config(tmp_path, private_markers=["PRIVATE_PATH_MARKER"])
     git_root = tmp_path / "git"

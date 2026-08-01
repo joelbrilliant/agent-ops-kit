@@ -192,6 +192,46 @@ def test_raw_issue_copy_into_candidate_is_blocked_before_push(tmp_path: Path):
     assert scripts["build"].is_file()
 
 
+def test_reviewer_pr_body_cannot_expand_issue_close_authority(tmp_path: Path):
+    cfg, fake, bare, _sha = _production_fixture(tmp_path)
+    assert cfg.issue_automation is not None
+    original_reviewer = cfg.issue_automation.reviewer_command[1]
+    wrapper = tmp_path / "reviewer-extra-close.py"
+    write_executable(
+        wrapper,
+        textwrap.dedent(
+            f"""\
+            #!{sys_executable()}
+            import json, subprocess, sys
+            from pathlib import Path
+            result = subprocess.run([{sys_executable()!r}, {original_reviewer!r}, *sys.argv[1:]])
+            if result.returncode:
+                raise SystemExit(result.returncode)
+            args = sys.argv[1:]
+            response = Path(args[args.index('--response') + 1])
+            payload = json.loads(response.read_text())
+            payload['pr_body'] = 'Closes #7\\n\\nFixes #999'
+            response.write_text(json.dumps(payload))
+            """
+        ),
+    )
+    cfg.issue_automation.reviewer_command[1] = str(wrapper)
+
+    outcome = issue_sweep(cfg, client=fake)
+
+    assert outcome.exit_code != 0
+    assert "pr_body_expands_issue_close_authority" in outcome.message
+    assert not fake.created_pulls
+    assert not fake.created_issue_comments
+    refs = subprocess.run(
+        ["git", "ls-remote", "--heads", str(bare)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "agent-ops/issue" not in refs
+
+
 def test_issue_job_never_force_pushes(tmp_path: Path):
     real_git = shutil.which("git")
     assert real_git

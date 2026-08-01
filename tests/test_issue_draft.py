@@ -430,7 +430,9 @@ def test_issue_public_signal_redacts_bodies(tmp_path: Path):
 
     cfg = Config(**data)
 
-    secret_body = "fix demo.txt /Users/private/secret token ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    secret_body = (
+        "fix demo.txt /Users/private/secret token " + "ghp" + "_" + ("x" * 32)
+    )
     wire_fake_for_issue(
         fake,
         base_sha=sha,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -474,6 +475,30 @@ def _compose_pr_title(issue_cfg: IssueAutomationConfig, signal: IssueSignalV1, f
     return title
 
 
+_CLOSING_ISSUE_REFERENCE_RE = re.compile(
+    r"(?i)\b(?:close(?:s|d)?|fix(?:es|ed)?|resolve(?:s|d)?)\s+"
+    r"(?P<reference>"
+    r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d+"
+    r"|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+"
+    r"|GH-\d+"
+    r"|#\d+"
+    r")\b"
+)
+
+
+def _prepare_pr_body(body: str, issue_number: int) -> str:
+    expected_reference = f"#{issue_number}"
+    references = [
+        match.group("reference")
+        for match in _CLOSING_ISSUE_REFERENCE_RE.finditer(body)
+    ]
+    if any(reference.lower() != expected_reference.lower() for reference in references):
+        raise RunnerContractError("pr_body_expands_issue_close_authority")
+    if expected_reference not in references:
+        return body.rstrip() + f"\n\nCloses {expected_reference}\n"
+    return body
+
+
 def _receipt(
     config: Config,
     *,
@@ -866,11 +891,7 @@ def run_claimed_issue_job(
             _effective_private_markers(config),
         )
         pr_title = _compose_pr_title(issue_cfg, signal, reviewer.pr_title)
-        pr_body = (
-            reviewer.pr_body
-            if f"closes #{signal.issue_number}" in reviewer.pr_body.lower()
-            else reviewer.pr_body.rstrip() + f"\n\nCloses #{signal.issue_number}\n"
-        )
+        pr_body = _prepare_pr_body(reviewer.pr_body, signal.issue_number)
         _assert_public_text_safe(
             pr_title, signal, _effective_private_markers(config)
         )

@@ -597,87 +597,23 @@ def test_issue_job_holds_when_base_sha_moves_before_push(tmp_path: Path):
     head_repo, sha = init_base_repo(git_root)
     bare = make_bare_remote(git_root, head_repo)
     fake = FakeGitHub()
-    issue = sample_issue()
-    wire_fake_for_issue(fake, issue=issue, base_sha=sha, clone_url=str(bare))
-    fetches = {"n": 0}
-    handlers = list(fake.graphql_handlers)
-
-    def gql(query_text: str, variables: Dict[str, Any]):
-        # ISSUE_DETAIL_QUERY includes defaultBranchRef target oid via separate path?
-        # Snapshot uses ISSUE_DETAIL_QUERY which does NOT include defaultBranchRef tip.
-        # Base sha is captured once at discovery via REST/graphql repository fields.
-        # Looking at issues.py - observed_base_sha comes from default branch at discovery.
-        # Re-fetch snapshot does not re-read base sha from remote default branch!
-        #
-        # For this test we simulate base move by changing the issue's bound observed
-        # comparison through a patched fetch that alters live.observed_base_sha by
-        # rewriting the signal comparison inputs is not available on snapshot.
-        #
-        # Production currently binds observed_base_sha at discovery and compares the
-        # same field on re-fetch. ISSUE_DETAIL_QUERY does not re-query default branch
-        # tip - so base move detection depends on worktree ancestor checks + remote tip
-        # when creating worktree from the recorded base sha.
-        #
-        # Move bare main after claim so create_worktree/base ancestor or pre_push branch
-        # logic still uses recorded sha. Worktree is created FROM recorded base_sha, so
-        # moving main does not change recorded base. AC-4 wants observed base SHA recheck.
-        #
-        # To exercise host comparison, inject a second search-time base via mutating the
-        # stored signal is internal. Instead, after first snapshot, change issue node id
-        # equality path is not base. We'll mutate via monkeypatch of remote_ref for main
-        # is not compared on pre_push.
-        #
-        # Practical proof: mutate live signal fields by making fetch return a different
-        # conversation while we also rewrite base via custom ISSUE detail that includes
-        # a forged default tip. Since fetch_issue_snapshot doesn't read default tip,
-        # force stale by changing observed_base_sha equality through issue updated fields
-        # is wrong test.
-        #
-        # Implement by patching IssueSignal after discovery... skip and use conversation
-        # change equivalent already covered. For base specifically, create_worktree uses
-        # signal.observed_base_sha; if bare main moves, worktree still uses old sha object
-        # which remains reachable. Host should compare live default branch tip.
-        #
-        # DEFECT candidate: fetch_issue_snapshot does not re-read default branch tip.
-        # Keep test as HOLD trigger by changing labels/digest first, and add a focused
-        # unit-level assertion if we extend snapshot.
-        return None
-
-    # Stronger approach: replace handlers to return an issue snapshot with a different
-    # synthetic observed base by editing discover path only once, then on later issue
-    # detail calls return skip via closed state after work starts - already covered.
-    # For base SHA: mutate the bare repo and also patch signal by intercepting rest? 
-    # We'll implement production fix: include defaultBranchRef tip in snapshot and compare.
+    wire_fake_for_issue(fake, issue=sample_issue(), base_sha=sha, clone_url=str(bare))
     _install_head_sync(fake, bare)
-    # Move main after initial discovery by wrapping issue_sweep phases via fetch counter
-    # on issue detail and simultaneously patching live signal is not possible.
-    # Use monkeypatch on fetch_issue_snapshot.
-    import agent_ops.maintenance.issue_fix as issue_fix_mod
-    from agent_ops.github import issues as issues_mod
+    ref_fetches = {"count": 0}
 
-    original = issues_mod.fetch_issue_snapshot
-    calls = {"n": 0}
+    def moving_base(query_text: str, _variables: Dict[str, Any]):
+        if "ref(qualifiedName" not in query_text:
+            return None
+        ref_fetches["count"] += 1
+        oid = sha if ref_fetches["count"] < 3 else "0" * 40
+        return {"data": {"repository": {"ref": {"target": {"oid": oid}}}}}
 
-    def wrapped(*args, **kwargs):
-        live, skip, meta = original(*args, **kwargs)
-        calls["n"] += 1
-        if live is not None and calls["n"] >= 3:
-            # Simulate default-branch tip movement on revalidation.
-            object.__setattr__(live, "observed_base_sha", "0" * 40) if False else None
-            from dataclasses import replace
+    fake.graphql_handlers.insert(0, moving_base)
+    out = issue_sweep(cfg, client=fake)
 
-            live = replace(live, observed_base_sha="0" * 40)
-        return live, skip, meta
-
-    issues_mod.fetch_issue_snapshot = wrapped  # type: ignore[assignment]
-    issue_fix_mod.fetch_issue_snapshot = wrapped  # type: ignore[assignment]
-    try:
-        out = issue_sweep(cfg, client=fake)
-    finally:
-        issues_mod.fetch_issue_snapshot = original  # type: ignore[assignment]
-        issue_fix_mod.fetch_issue_snapshot = original  # type: ignore[assignment]
     assert out.exit_code != 0
     assert out.jobs_completed == 0
+    assert ref_fetches["count"] == 3
     assert not fake.created_pulls
 
 

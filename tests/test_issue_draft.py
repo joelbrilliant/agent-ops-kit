@@ -430,8 +430,9 @@ def test_issue_public_signal_redacts_bodies(tmp_path: Path):
 
     cfg = Config(**data)
 
+    private_path = "/" + "Users" + "/private"
     secret_body = (
-        "fix demo.txt /Users/private/secret token " + "ghp" + "_" + ("x" * 32)
+        f"fix demo.txt {private_path}/secret token " + "ghp" + "_" + ("x" * 32)
     )
     wire_fake_for_issue(
         fake,
@@ -445,7 +446,7 @@ def test_issue_public_signal_redacts_bodies(tmp_path: Path):
     public = discovered.signals[0].to_public_dict()
     blob = json.dumps(public)
     assert "ghp_" not in blob
-    assert "/Users/private" not in blob
+    assert private_path not in blob
     assert secret_body not in blob
     assert public["schema"] == "IssueSignalV1"
     assert "labels" not in public

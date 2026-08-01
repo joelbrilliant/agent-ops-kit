@@ -206,3 +206,49 @@ def test_inspect_only_does_not_mark_read(tmp_path: Path) -> None:
     outcome = inspect_notifications(cfg, client=gh)
     assert outcome.dismissed + outcome.needs_joel + outcome.acted_fix >= 1
     assert gh.marked_read == []
+
+
+def test_needs_joel_command_rejects_embedded_message_placeholder(tmp_path: Path) -> None:
+    sink = tmp_path / "sink.txt"
+    cfg = make_config(
+        tmp_path,
+        notification_triage=NotificationTriagePolicy(
+            enabled=True,
+            needs_joel_command=["/bin/sh", "-c", "echo {message} > " + str(sink)],
+        ),
+    )
+    gh = FakeGitHub()
+    gh.login = "operator"
+    gh.notifications = [
+        {
+            "id": "inj-1",
+            "reason": "ci_activity",
+            "unread": True,
+            "updated_at": "2026-08-02T00:00:00Z",
+            "subject": {
+                "title": "CI workflow run failed for feat/x branch",
+                "type": "CheckSuite",
+                "url": "",
+            },
+            "repository": {"full_name": "operator/demo"},
+        }
+    ]
+    gh.search_pages = {
+        "repo:operator/demo is:pr is:open head:feat/x author:operator": [
+            [
+                {
+                    "number": 9,
+                    "pull_request": {"url": "https://api.github.com/repos/operator/demo/pulls/9"},
+                    "html_url": "https://github.com/operator/demo/pull/9",
+                    "user": {"login": "operator"},
+                }
+            ]
+        ]
+    }
+    gh.required_check_rows["operator/demo#9"] = [
+        {"bucket": "fail", "name": "unit", "state": "FAILURE"}
+    ]
+    out = triage_notifications(cfg, client=gh, run_fix_sweep=False)
+    assert out.needs_joel == 1
+    assert out.notified_joel == 0
+    assert not sink.exists()

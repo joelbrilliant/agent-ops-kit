@@ -706,9 +706,19 @@ def _notify_joel(config: Config, summary: str) -> bool:
     text = redact_text(summary, config.private_markers)
     if not text.strip():
         return False
-    argv = [part.replace("{message}", text) for part in command]
-    if "{message}" not in "\n".join(command):
-        # If template omitted placeholder, append message as final argv.
+    # Safety: {message} may only appear as a whole argv token. Never interpolate into
+    # a larger string (blocks sh -c "…{message}…" injection from untrusted titles).
+    argv: List[str] = []
+    saw_placeholder = False
+    for part in command:
+        if part == "{message}":
+            argv.append(text)
+            saw_placeholder = True
+        elif "{message}" in part:
+            return False
+        else:
+            argv.append(part)
+    if not saw_placeholder:
         argv = command + [text]
     result = run_argv(argv, timeout=60, check=False)
     return result.ok

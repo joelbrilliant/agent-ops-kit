@@ -68,6 +68,56 @@
       "verification_commands": {}
     }
   },
+  "issue_automation": {
+    "enabled": true,
+    "enabled_repositories": {
+      "YOUR_GITHUB_LOGIN/YOUR_REPOSITORY": "main"
+    },
+    "trigger_label": "agent-ops:ready",
+    "branch_prefix": "agent-ops/issue",
+    "classifier_command": [
+      "python3",
+      "/absolute/path/to/your-issue-classifier.py",
+      "--request",
+      "{request_path}",
+      "--response",
+      "{response_path}"
+    ],
+    "builder_command": [
+      "python3",
+      "/absolute/path/to/your-issue-builder.py",
+      "--request",
+      "{request_path}",
+      "--response",
+      "{response_path}",
+      "--worktree",
+      "{worktree_path}"
+    ],
+    "reviewer_command": [
+      "python3",
+      "/absolute/path/to/your-issue-reviewer.py",
+      "--request",
+      "{request_path}",
+      "--response",
+      "{response_path}",
+      "--worktree",
+      "{worktree_path}"
+    ],
+    "build_runner_identity": {
+      "profile": "build",
+      "provider": "xai-oauth",
+      "model": "grok-composer-2.5-fast",
+      "reasoning_effort": "low",
+      "service_tier": "standard"
+    },
+    "review_runner_identity": {
+      "profile": "review",
+      "provider": "openai-codex",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "xhigh",
+      "service_tier": "fast"
+    }
+  },
   "reclaim_after_seconds": 21600,
   "runner_timeout_seconds": 3600
 }

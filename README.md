@@ -23,9 +23,16 @@ agent-ops pr status --config /path/to/config.json
 agent-ops pr pause --config /path/to/config.json
 agent-ops pr resume --config /path/to/config.json
 agent-ops pr clear-circuit --config /path/to/config.json
+
+agent-ops issue inspect --config /path/to/config.json
+agent-ops issue sweep --config /path/to/config.json
 ```
 
 Exit codes: `0` no work or completed work, `1` held job or open circuit, `2` invalid config or missing tooling.
+
+### Issue automation (Slice 3)
+
+When `issue_automation` is enabled in config, a maintainer label (default `agent-ops:ready`) authorises evaluation of one open issue in an explicitly listed repository. The tool classifies before any worktree exists, builds a bounded routine fix on a new non-force branch, runs a fresh review-profile fixer, opens a verified draft PR, and posts a Joel-voice reply on the originating issue. Raw issue text never enters argv, branch names, or receipts. A second sweep must launch no model and perform no duplicate write.
 
 ### Configuration
 

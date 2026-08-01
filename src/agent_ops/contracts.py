@@ -26,6 +26,25 @@ def signal_digest(signal: "SignalV1") -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def issue_signal_digest(signal: "IssueSignalV1") -> str:
+    payload = "|".join(
+        [
+            signal.repository,
+            str(signal.issue_number),
+            signal.issue_node_id,
+            signal.conversation_digest,
+            signal.observed_updated_at,
+            signal.latest_comment_node_id,
+            signal.observed_base_sha,
+            signal.title_digest,
+            signal.body_digest,
+            ",".join(signal.labels),
+            signal.author_login,
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class SignalV1:
     repository: str
@@ -109,6 +128,7 @@ class TaskSpecV1:
     approval_class: str
     repository: str = ""
     pr_number: int = 0
+    issue_number: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -116,6 +136,7 @@ class TaskSpecV1:
             "goal": self.goal,
             "repository": self.repository,
             "pr_number": self.pr_number,
+            "issue_number": self.issue_number,
             "base_sha": self.base_sha,
             "permitted_paths": list(self.permitted_paths),
             "permitted_actions": list(self.permitted_actions),
@@ -136,6 +157,7 @@ class TaskSpecV1:
             approval_class=str(data.get("approval_class", "routine")),
             repository=str(data.get("repository", "")),
             pr_number=int(data.get("pr_number", 0) or 0),
+            issue_number=int(data.get("issue_number", 0) or 0),
         )
 
 
@@ -208,6 +230,85 @@ class EvidenceBundleV1:
             "resulting_sha": self.resulting_sha,
             "checks": [c.to_dict() for c in self.checks],
             "verdict": self.verdict,
+            "redaction_record": dict(self.redaction_record),
+        }
+
+
+@dataclass(frozen=True)
+class IssueSignalV1:
+    repository: str
+    issue_number: int
+    issue_node_id: str
+    issue_url: str
+    title_digest: str
+    body_digest: str
+    conversation_digest: str
+    labels: List[str]
+    author_login: str
+    observed_updated_at: str
+    latest_comment_node_id: str
+    base_ref: str
+    observed_base_sha: str
+    head_repository: str
+    clone_url: str = ""
+    untrusted: bool = True
+    # Ephemeral orchestration-only fields. Never public, never in receipts.
+    _raw_title: str = field(default="", repr=False, compare=False)
+    _raw_body: str = field(default="", repr=False, compare=False)
+    _raw_comments: List[Dict[str, Any]] = field(default_factory=list, repr=False, compare=False)
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        return {
+            "schema": "IssueSignalV1",
+            "repository": self.repository,
+            "issue_number": self.issue_number,
+            "issue_node_id": self.issue_node_id,
+            "issue_url": self.issue_url,
+            "title_digest": self.title_digest,
+            "body_digest": self.body_digest,
+            "conversation_digest": self.conversation_digest,
+            "labels": list(self.labels),
+            "author_login": self.author_login,
+            "observed_updated_at": self.observed_updated_at,
+            "latest_comment_node_id": self.latest_comment_node_id,
+            "base_ref": self.base_ref,
+            "observed_base_sha": self.observed_base_sha,
+            "head_repository": self.head_repository or self.repository,
+            "untrusted": True,
+        }
+
+
+@dataclass
+class IssueDraftReceiptV1:
+    signal_digest: str
+    repository: str
+    issue_number: int
+    base_sha: str
+    resulting_sha: str
+    branch_name: str
+    draft_pr_number: Optional[int]
+    draft_pr_url: Optional[str]
+    issue_reply_node_id: Optional[str]
+    named_checks: List[str]
+    outcome: str
+    hold_reason: Optional[str] = None
+    redaction_record: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema": "IssueDraftReceiptV1",
+            "signal_digest": self.signal_digest,
+            "repository": self.repository,
+            "issue_number": self.issue_number,
+            "base_sha": self.base_sha,
+            "resulting_sha": self.resulting_sha,
+            "branch_name": self.branch_name,
+            "draft_pr_number": self.draft_pr_number,
+            "draft_pr_url": self.draft_pr_url,
+            "issue_reply_node_id": self.issue_reply_node_id,
+            "named_checks": list(self.named_checks),
+            "outcome": self.outcome,
+            "hold_reason": self.hold_reason,
             "redaction_record": dict(self.redaction_record),
         }
 

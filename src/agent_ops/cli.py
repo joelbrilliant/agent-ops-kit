@@ -13,6 +13,7 @@ from agent_ops.audit.redaction import redact_text
 from agent_ops.config import ConfigError, load_config
 from agent_ops.exit_codes import HELD, OK, USAGE_OR_TOOLING
 from agent_ops.github.client import GitHubError
+from agent_ops.maintenance.issue_fix import inspect_issue_work, issue_sweep
 from agent_ops.maintenance.ledger import Ledger
 from agent_ops.maintenance.orchestrator import (
     inspect_work,
@@ -71,6 +72,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_config(p_clear)
 
+    issue = sub.add_parser("issue", help="Issue-to-draft-PR automation")
+    issue_sub = issue.add_subparsers(dest="issue_command", required=True)
+
+    p_issue_inspect = issue_sub.add_parser(
+        "inspect",
+        help="Discover eligible labelled issues without claiming or launching models",
+    )
+    add_config(p_issue_inspect)
+
+    p_issue_sweep = issue_sub.add_parser(
+        "sweep",
+        help="One serial issue sweep then exit",
+    )
+    add_config(p_issue_sweep)
+
     return parser
 
 
@@ -78,7 +94,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command != "pr":
+    if args.command not in ("pr", "issue"):
         parser.error("unknown command")
         return USAGE_OR_TOOLING
 
@@ -86,6 +102,54 @@ def main(argv: Optional[List[str]] = None) -> int:
         config = load_config(args.config)
     except ConfigError as exc:
         sys.stderr.write(f"config error: {exc}\n")
+        return USAGE_OR_TOOLING
+
+    if args.command == "issue":
+        if config.issue_automation is None:
+            sys.stderr.write("config error: issue_automation is not configured\n")
+            return USAGE_OR_TOOLING
+        tool_err = _require_tools(config.gh_command, config.git_command)
+        if tool_err:
+            sys.stderr.write(f"tooling error: {tool_err}\n")
+            return USAGE_OR_TOOLING
+        if args.issue_command == "inspect":
+            try:
+                result = inspect_issue_work(config)
+            except (GitHubError, RunnerError, OSError, ValueError) as exc:
+                detail = redact_text(str(exc) or exc.__class__.__name__, config.private_markers)
+                sys.stderr.write(f"issue inspect error: {detail}\n")
+                return HELD
+            _print_json(
+                {
+                    "paused": is_paused(config),
+                    "inspected_issues": result.inspected_issues,
+                    "signals": [s.to_public_dict() for s in result.signals],
+                    "skips": [
+                        {
+                            "repository": s.repository,
+                            "issue_number": s.issue_number,
+                            "reason": s.reason,
+                            "issue_node_id": s.issue_node_id,
+                        }
+                        for s in result.skips
+                    ],
+                }
+            )
+            return OK
+        if args.issue_command == "sweep":
+            outcome = issue_sweep(config)
+            if outcome.message in (
+                "no_actionable_signal",
+                "paused_inspect_only",
+                "busy_inspect_only",
+                "issue_automation_disabled",
+            ):
+                if config.notification_mode == "verbose":
+                    sys.stdout.write(outcome.message + "\n")
+                return OK
+            sys.stdout.write(outcome.message + "\n")
+            return outcome.exit_code
+        parser.error("unknown issue subcommand")
         return USAGE_OR_TOOLING
 
     tool_err = _require_tools(config.gh_command, config.git_command)
@@ -140,7 +204,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.pr_command == "sweep":
         outcome = sweep(config)
-        # Operator visibility: silent for no work; concise otherwise
         if outcome.message in (
             "no_actionable_signal",
             "paused_inspect_only",

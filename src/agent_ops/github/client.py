@@ -23,6 +23,9 @@ class GitHubClient(Protocol):
     def rest_get(self, path: str) -> Dict[str, Any]:
         ...
 
+    def rest_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        ...
+
     def viewer_login(self) -> str:
         ...
 
@@ -62,6 +65,13 @@ class GhClient:
 
     def rest_get(self, path: str) -> Dict[str, Any]:
         result = self._run(["api", path])
+        return json.loads(result.stdout)
+
+    def rest_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        result = self._run(
+            ["api", "--method", "POST", path, "--input", "-"],
+            input_data=json.dumps(payload),
+        )
         return json.loads(result.stdout)
 
     def viewer_login(self) -> str:
@@ -110,10 +120,13 @@ class FakeGitHub:
         self.search_pages: Dict[str, List[List[Dict[str, Any]]]] = {}
         self.graphql_handlers: List[Callable[[str, Dict[str, Any]], Optional[Dict[str, Any]]]] = []
         self.rest_handlers: Dict[str, Any] = {}
+        self.rest_post_handlers: Dict[str, Any] = {}
         self.login = "operator"
         self.replies: List[Dict[str, Any]] = []
         self.mutations: List[Dict[str, Any]] = []
         self.required_check_rows: Dict[str, Any] = {}
+        self.created_pulls: List[Dict[str, Any]] = []
+        self.created_issue_comments: List[Dict[str, Any]] = []
 
     def rest_search_issues(self, query: str, page: int = 1, per_page: int = 100) -> Dict[str, Any]:
         pages: List[List[Dict[str, Any]]] = self.search_pages.get(query, [])
@@ -136,12 +149,45 @@ class FakeGitHub:
         if path in self.rest_handlers:
             val = self.rest_handlers[path]
             out = val() if callable(val) else val
+            if isinstance(out, list):
+                return out  # type: ignore[return-value]
             return dict(out)  # type: ignore[arg-type]
         for key, val in self.rest_handlers.items():
             if key in path:
                 out = val() if callable(val) else val
+                if isinstance(out, list):
+                    return out  # type: ignore[return-value]
                 return dict(out)  # type: ignore[arg-type]
         raise GitHubError(f"no fake rest handler for {path}")
+
+    def rest_post(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if path in self.rest_post_handlers:
+            val = self.rest_post_handlers[path]
+            out = val(payload) if callable(val) else val
+            return dict(out)  # type: ignore[arg-type]
+        for key, val in self.rest_post_handlers.items():
+            if key in path:
+                out = val(payload) if callable(val) else val
+                return dict(out)  # type: ignore[arg-type]
+        # Default draft PR creator for tests.
+        if path.endswith("/pulls"):
+            number = 9000 + len(self.created_pulls) + 1
+            head = str(payload.get("head") or "branch")
+            if ":" in head:
+                head = head.split(":", 1)[1]
+            row = {
+                "number": number,
+                "html_url": f"https://github.com/example/pull/{number}",
+                "node_id": f"PR_NODE_{number}",
+                "draft": bool(payload.get("draft", True)),
+                "title": payload.get("title"),
+                "body": payload.get("body"),
+                "head": {"ref": head, "sha": payload.get("_head_sha") or "headsha"},
+                "base": {"ref": payload.get("base")},
+            }
+            self.created_pulls.append({"path": path, "payload": dict(payload), "response": row})
+            return dict(row)
+        raise GitHubError(f"no fake rest_post handler for {path}")
 
     def viewer_login(self) -> str:
         return self.login

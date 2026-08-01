@@ -37,6 +37,30 @@ class RunnerIdentityPolicy:
 
 
 @dataclass(frozen=True)
+class IssueAutomationConfig:
+    enabled: bool
+    enabled_repositories: Dict[str, str]
+    require_labels: List[str]
+    ignore_labels: List[str]
+    branch_prefix: str
+    draft_pr_title_template: str
+    issue_reply_template: str
+    max_paths_per_issue: int
+    max_changed_files: int
+    max_diff_lines: int
+    classifier_command: List[str]
+    builder_command: List[str]
+    reviewer_command: List[str]
+    build_runner_identity: RunnerIdentityPolicy
+    review_runner_identity: RunnerIdentityPolicy
+
+    @property
+    def trigger_label(self) -> str:
+        """Backward-compatible single-label accessor for the first require label."""
+        return self.require_labels[0] if self.require_labels else ""
+
+
+@dataclass(frozen=True)
 class Config:
     operator_logins: List[str]
     owned_namespaces: List[str]
@@ -61,6 +85,7 @@ class Config:
     gh_command: str = "gh"
     git_command: str = "git"
     trusted_reviewer_associations: List[str] = field(default_factory=list)
+    issue_automation: Optional[IssueAutomationConfig] = None
 
     def is_excluded(self, repository: str) -> bool:
         repo = repository.lower()
@@ -71,6 +96,9 @@ class Config:
         if exact is not None:
             return exact
         return self.repository_policies.get("*")
+
+    def exact_policy_for(self, repository: str) -> Optional[RepoPolicy]:
+        return self.repository_policies.get(repository.lower())
 
 
 def _require_str_list(data: Mapping[str, Any], key: str, *, allow_empty: bool = False) -> List[str]:
@@ -124,18 +152,18 @@ def _parse_verification_map(raw: Any, label: str) -> Dict[str, List[str]]:
     return out
 
 
-def _runner_identity_policy(raw: Any) -> RunnerIdentityPolicy:
+def _runner_identity_policy(raw: Any, *, label: str = "required_runner_identity") -> RunnerIdentityPolicy:
     if not isinstance(raw, dict):
-        raise ConfigError("required_runner_identity must be an object")
+        raise ConfigError(f"{label} must be an object")
     expected = {"profile", "provider", "model", "reasoning_effort", "service_tier"}
     if set(raw) != expected:
         raise ConfigError(
-            "required_runner_identity must contain exactly profile, provider, model, "
+            f"{label} must contain exactly profile, provider, model, "
             "reasoning_effort, service_tier"
         )
     values = {key: str(raw[key]).strip() for key in expected}
     if not all(values.values()):
-        raise ConfigError("required_runner_identity values must not be empty")
+        raise ConfigError(f"{label} values must not be empty")
     return RunnerIdentityPolicy(**values)
 
 
@@ -171,6 +199,203 @@ def _environment_allowlist(raw: Any) -> List[str]:
     return names
 
 
+_SAFE_BRANCH_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _parse_issue_command(
+    raw: Mapping[str, Any],
+    key: str,
+    *,
+    required_placeholders: Sequence[str],
+) -> List[str]:
+    if key not in raw:
+        raise ConfigError(f"issue_automation.{key} is required")
+    value = raw[key]
+    if not isinstance(value, list) or not value or not all(isinstance(x, str) for x in value):
+        raise ConfigError(f"issue_automation.{key} must be a non-empty array of strings (argv)")
+    command = list(value)
+    joined = "\n".join(command)
+    missing = [placeholder for placeholder in required_placeholders if placeholder not in joined]
+    if missing:
+        raise ConfigError(
+            f"issue_automation.{key} is missing placeholders: {','.join(missing)}"
+        )
+    if any("\x00" in part or "\n" in part or "\r" in part for part in command):
+        raise ConfigError(f"issue_automation.{key} contains a control character")
+    return command
+
+
+def _parse_issue_automation(raw: Any) -> IssueAutomationConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("issue_automation must be an object")
+    allowed = {
+        "enabled",
+        "enabled_repositories",
+        "repositories",
+        "require_labels",
+        "ignore_labels",
+        "trigger_label",
+        "branch_prefix",
+        "draft_pr_title_template",
+        "issue_reply_template",
+        "max_paths_per_issue",
+        "max_changed_files",
+        "max_diff_lines",
+        "classifier_command",
+        "builder_command",
+        "reviewer_command",
+        "build_runner_identity",
+        "review_runner_identity",
+    }
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ConfigError("unknown issue_automation keys: " + ",".join(unknown))
+
+    if "enabled" not in raw or not isinstance(raw.get("enabled"), bool):
+        raise ConfigError("issue_automation.enabled must be a boolean")
+    enabled = bool(raw["enabled"])
+
+    enabled_raw = raw.get("enabled_repositories")
+    if enabled_raw is None and isinstance(raw.get("repositories"), list):
+        # Packet shape: repositories allowlist; default branch resolved at runtime.
+        repos_list = raw.get("repositories") or []
+        if not all(isinstance(item, str) for item in repos_list):
+            raise ConfigError("issue_automation.repositories must be an array of strings")
+        enabled_raw = {str(item): "main" for item in repos_list}
+    if not isinstance(enabled_raw, dict) or not enabled_raw:
+        raise ConfigError(
+            "issue_automation.enabled_repositories must be a non-empty object of owner/name -> base branch"
+        )
+    enabled_repositories: Dict[str, str] = {}
+    for repo, base in enabled_raw.items():
+        if not isinstance(repo, str) or not isinstance(base, str):
+            raise ConfigError(
+                "issue_automation.enabled_repositories keys and values must be strings"
+            )
+        repo_key = repo.strip()
+        base_ref = base.strip().strip("/")
+        if not _SAFE_REPO_RE.fullmatch(repo_key) or ".." in repo_key:
+            raise ConfigError(
+                f"issue_automation.enabled_repositories key is not exact owner/name: {repo}"
+            )
+        if not base_ref or not _SAFE_BRANCH_PREFIX_RE.match(base_ref) or ".." in base_ref:
+            raise ConfigError(
+                f"issue_automation.enabled_repositories base branch is unsafe for {repo_key}"
+            )
+        lowered = repo_key.lower()
+        if lowered in {k.lower() for k in enabled_repositories}:
+            raise ConfigError(f"duplicate enabled repository: {repo_key}")
+        enabled_repositories[repo_key] = base_ref
+
+    require_labels: List[str] = []
+    if "require_labels" in raw:
+        value = raw.get("require_labels")
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ConfigError("issue_automation.require_labels must be an array of strings")
+        require_labels = [item.strip() for item in value if str(item).strip()]
+    elif "trigger_label" in raw:
+        trigger_label = str(raw.get("trigger_label", "")).strip()
+        if trigger_label:
+            require_labels = [trigger_label]
+    if not require_labels:
+        raise ConfigError("issue_automation.require_labels (or trigger_label) must not be empty")
+    for label in require_labels:
+        if any(ch in label for ch in ("\n", "\r", "\x00")):
+            raise ConfigError("issue_automation.require_labels contains a control character")
+
+    ignore_labels: List[str] = []
+    if "ignore_labels" in raw:
+        value = raw.get("ignore_labels")
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ConfigError("issue_automation.ignore_labels must be an array of strings")
+        ignore_labels = [item.strip() for item in value if str(item).strip()]
+        for label in ignore_labels:
+            if any(ch in label for ch in ("\n", "\r", "\x00")):
+                raise ConfigError("issue_automation.ignore_labels contains a control character")
+
+    branch_prefix = str(raw.get("branch_prefix", "agent-ops/issue")).strip().strip("/")
+    if not branch_prefix or not _SAFE_BRANCH_PREFIX_RE.match(branch_prefix):
+        raise ConfigError("issue_automation.branch_prefix is unsafe or missing")
+    if ".." in branch_prefix or branch_prefix.startswith("-") or branch_prefix.endswith(".lock"):
+        raise ConfigError("issue_automation.branch_prefix is unsafe")
+
+    title_tpl = str(raw.get("draft_pr_title_template", "agent-ops: issue #{issue_number}")).strip()
+    reply_tpl = str(
+        raw.get(
+            "issue_reply_template",
+            "Draft PR ready: {pr_url}\nSHA: {resulting_sha}\nChecks: {named_checks}",
+        )
+    ).strip()
+    if not title_tpl or not reply_tpl:
+        raise ConfigError("issue_automation title/reply templates are required")
+    if any(ch in title_tpl for ch in ("\x00", "\r")):
+        raise ConfigError("issue_automation.draft_pr_title_template contains a control character")
+    if "\x00" in reply_tpl:
+        raise ConfigError("issue_automation.issue_reply_template contains a control character")
+
+    def _positive_int(key: str, default: int) -> int:
+        if key not in raw:
+            return default
+        try:
+            value = int(raw[key])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"issue_automation.{key} must be an integer") from exc
+        if value < 1:
+            raise ConfigError(f"issue_automation.{key} must be >= 1")
+        return value
+
+    max_paths = _positive_int("max_paths_per_issue", 8)
+    max_files = _positive_int("max_changed_files", 20)
+    max_diff = _positive_int("max_diff_lines", 400)
+
+    classifier_command = _parse_issue_command(
+        raw,
+        "classifier_command",
+        required_placeholders=("{request_path}", "{response_path}"),
+    )
+    builder_command = _parse_issue_command(
+        raw,
+        "builder_command",
+        required_placeholders=("{request_path}", "{response_path}", "{worktree_path}"),
+    )
+    reviewer_command = _parse_issue_command(
+        raw,
+        "reviewer_command",
+        required_placeholders=("{request_path}", "{response_path}", "{worktree_path}"),
+    )
+    build_identity = _runner_identity_policy(
+        raw.get("build_runner_identity"),
+        label="issue_automation.build_runner_identity",
+    )
+    review_identity = _runner_identity_policy(
+        raw.get("review_runner_identity"),
+        label="issue_automation.review_runner_identity",
+    )
+    if build_identity == review_identity:
+        raise ConfigError(
+            "issue_automation.build_runner_identity and review_runner_identity must be distinct"
+        )
+
+    return IssueAutomationConfig(
+        enabled=enabled,
+        enabled_repositories=enabled_repositories,
+        require_labels=require_labels,
+        ignore_labels=ignore_labels,
+        branch_prefix=branch_prefix,
+        draft_pr_title_template=title_tpl,
+        issue_reply_template=reply_tpl,
+        max_paths_per_issue=max_paths,
+        max_changed_files=max_files,
+        max_diff_lines=max_diff,
+        classifier_command=classifier_command,
+        builder_command=builder_command,
+        reviewer_command=reviewer_command,
+        build_runner_identity=build_identity,
+        review_runner_identity=review_identity,
+    )
+
+
 def load_config(path: Union[str, Path]) -> Config:
     cfg_path = Path(path).expanduser().resolve()
     if not cfg_path.is_file():
@@ -204,6 +429,7 @@ def load_config(path: Union[str, Path]) -> Config:
         "runner_timeout_seconds",
         "gh_command",
         "git_command",
+        "issue_automation",
     }
     unknown_keys = sorted(set(data) - allowed_keys)
     if unknown_keys:
@@ -335,6 +561,20 @@ def load_config(path: Union[str, Path]) -> Config:
     if not pause_file_name or Path(pause_file_name).name != pause_file_name:
         raise ConfigError("pause_file_name must be a simple file name")
 
+    issue_automation = None
+    if "issue_automation" in data and data.get("issue_automation") is not None:
+        issue_automation = _parse_issue_automation(data.get("issue_automation"))
+        for repository in issue_automation.enabled_repositories:
+            if repository.lower() not in repo_policies or repository.lower() == "*":
+                raise ConfigError(
+                    f"issue_automation repository {repository} requires an exact repository_policies entry"
+                )
+            policy = repo_policies[repository.lower()]
+            if not policy.permitted_paths:
+                raise ConfigError(
+                    f"issue_automation repository {repository} exact policy must define permitted_paths"
+                )
+
     return Config(
         operator_logins=operator_logins,
         owned_namespaces=owned_namespaces,
@@ -359,6 +599,7 @@ def load_config(path: Union[str, Path]) -> Config:
         gh_command=str(data.get("gh_command", "gh")),
         git_command=str(data.get("git_command", "git")),
         trusted_reviewer_associations=associations,
+        issue_automation=issue_automation,
     )
 
 

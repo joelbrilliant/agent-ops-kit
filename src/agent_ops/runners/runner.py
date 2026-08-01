@@ -63,6 +63,20 @@ class ReviewerResult:
     voice_gate: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class IssueReviewerResult:
+    identity: RunnerIdentity
+    reviewed_sha: str
+    resulting_sha: str
+    verdict: str
+    findings: List[Dict[str, Any]]
+    fixes: List[str]
+    reply_draft: str
+    pr_title: str
+    pr_body: str
+    voice_gate: Dict[str, Any]
+
+
 def write_owner_only_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
@@ -519,6 +533,143 @@ def run_reviewer(
         findings=list(findings),
         fixes=list(fixes),
         reply_draft=reply_draft,
+        voice_gate=dict(voice_gate),
+    )
+
+
+def run_issue_reviewer(
+    command_template: Sequence[str],
+    *,
+    task: TaskSpecV1,
+    base_sha: str,
+    candidate_sha: str,
+    diff_text: str,
+    verification: List[Dict[str, Any]],
+    state_dir: Path,
+    worktree_path: Path,
+    run_id: str,
+    classifier_identity: RunnerIdentity,
+    required_identity: RunnerIdentityPolicy,
+    runner_environment: Mapping[str, str],
+    timeout: int = 3600,
+) -> IssueReviewerResult:
+    req = state_dir / "requests" / f"{run_id}-issue-review-request.json"
+    resp = state_dir / "requests" / f"{run_id}-issue-review-response.json"
+    if resp.exists():
+        resp.unlink()
+    write_owner_only_json(
+        req,
+        {
+            "schema": "IssueReviewerRequestV1",
+            "task": task.to_dict(),
+            "base_sha": base_sha,
+            "candidate_sha": candidate_sha,
+            "diff": diff_text,
+            "verification": verification,
+            "required_reply_register": "public-community-short-reply",
+        },
+    )
+    result = run_runner(
+        command_template,
+        request_path=req,
+        response_path=resp,
+        worktree_path=worktree_path,
+        timeout=timeout,
+        cwd=worktree_path,
+        env=runner_environment,
+    )
+    if not result.ok:
+        raise RunnerContractError(f"reviewer_failed:{result.returncode}")
+    data = _read_response(
+        resp,
+        "IssueReviewerResponseV1",
+        (
+            "schema",
+            "runner_identity",
+            "reviewed_sha",
+            "resulting_sha",
+            "verdict",
+            "findings",
+            "fixes",
+            "reply_draft",
+            "pr_title",
+            "pr_body",
+            "voice_gate",
+        ),
+    )
+    identity = _identity_from_dict(data.get("runner_identity"))
+    validate_runner_identity(
+        identity,
+        required_identity,
+        fresh_session=True,
+        forbidden_session_id=classifier_identity.session_id,
+    )
+    reviewed_sha = str(data.get("reviewed_sha") or "")
+    resulting_sha = str(data.get("resulting_sha") or "")
+    verdict = str(data.get("verdict") or "")
+    findings = data.get("findings")
+    fixes = data.get("fixes")
+    reply_draft = data.get("reply_draft")
+    pr_title = data.get("pr_title")
+    pr_body = data.get("pr_body")
+    voice_gate = data.get("voice_gate")
+    if reviewed_sha != candidate_sha or not _SHA_RE.fullmatch(resulting_sha):
+        raise RunnerContractError("reviewer_sha_binding_mismatch")
+    if verdict not in ("PASS", "HOLD"):
+        raise RunnerContractError("reviewer_verdict_invalid")
+    if not isinstance(findings, list) or not all(
+        isinstance(finding, dict) for finding in findings
+    ):
+        raise RunnerContractError("reviewer_findings_invalid")
+    if not isinstance(fixes, list) or not all(isinstance(fix, str) for fix in fixes):
+        raise RunnerContractError("reviewer_fixes_invalid")
+    if verdict == "PASS" and findings:
+        raise RunnerContractError("reviewer_pass_with_unresolved_findings")
+    if not isinstance(reply_draft, str) or not reply_draft.strip():
+        raise RunnerContractError("reviewer_reply_draft_missing")
+    if not isinstance(pr_title, str) or not pr_title.strip():
+        raise RunnerContractError("reviewer_pr_title_missing")
+    if not isinstance(pr_body, str) or not pr_body.strip():
+        raise RunnerContractError("reviewer_pr_body_missing")
+    if any(control in pr_title for control in ("\n", "\r", "\x00")):
+        raise RunnerContractError("reviewer_pr_title_invalid")
+    if "\x00" in pr_body:
+        raise RunnerContractError("reviewer_pr_body_invalid")
+    if not isinstance(voice_gate, dict):
+        raise RunnerContractError("reviewer_voice_gate_invalid")
+    _require_exact_keys(
+        voice_gate,
+        (
+            "schema",
+            "shared_operator_contract_read",
+            "operator_profile_read",
+            "skill",
+            "reference",
+            "register",
+            "passed",
+        ),
+        "VoiceGateV1",
+    )
+    if voice_gate != {
+        "schema": "VoiceGateV1",
+        "shared_operator_contract_read": True,
+        "operator_profile_read": True,
+        "skill": "joel-voice-writing",
+        "reference": "references/voice.md",
+        "register": "public-community-short-reply",
+        "passed": True,
+    }:
+        raise RunnerContractError("reviewer_voice_gate_failed")
+    return IssueReviewerResult(
+        identity=identity,
+        reviewed_sha=reviewed_sha,
+        resulting_sha=resulting_sha,
+        verdict=verdict,
+        findings=list(findings),
+        fixes=list(fixes),
+        reply_draft=reply_draft,
+        pr_title=pr_title.strip(),
+        pr_body=pr_body,
         voice_gate=dict(voice_gate),
     )
 

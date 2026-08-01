@@ -29,6 +29,8 @@ agent-ops issue sweep --config /path/to/config.json
 
 agent-ops audit report --config /path/to/config.json --format json
 agent-ops audit report --config /path/to/config.json --format markdown
+
+agent-ops qa verify --config /path/to/config.json --spec /path/to/spec.json --repository /path/to/repository
 ```
 
 Exit codes: `0` no work or completed work, `1` held job or open circuit, `2` invalid config or missing tooling.
@@ -42,6 +44,12 @@ The audit command renders a deterministic, redacted summary of existing local PR
 When `issue_automation` is enabled in config, a maintainer label (default `agent-ops:ready`) authorises evaluation of one open issue in an explicitly listed repository. The tool classifies before any worktree exists, builds a bounded routine fix on a new non-force branch, runs a fresh review-profile fixer, opens a verified draft PR, and posts a Joel-voice reply on the originating issue. Raw issue text never enters argv, branch names, or receipts. A second sweep must launch no model and perform no duplicate write.
 
 Slice 3 remains canary-only. Synthetic and portable checks do not establish live GitHub readiness. Keep issue automation disabled until the prescribed live canaries pass under operator observation.
+
+### Repository QA gate
+
+The QA gate binds a clean local worktree to an exact SHA and exact GitHub repository identity, then runs trusted configured checks once each in a disposable no-hardlink clone. A spec may map acceptance criteria to configured check IDs, but it cannot supply commands. Standard output is a deterministic `EvidenceBundleV1` containing return codes, byte counts and output hashes, never raw check output or local paths.
+
+The isolation boundary is deliberately narrow. The gate gives checks a disposable-clone working directory, an owner-only temporary directory, an isolated Git configuration, no inherited credentials, offline hints for common package tools, and file-only Git protocol access. It detects source or clone mutation after each check. It is not an operating-system sandbox, so a trusted command or repository code it executes can still use raw network sockets or a known absolute filesystem path. Configure only checks whose executable and repository code are trusted for that machine. A `PASS` proves the recorded checks left the bound source unchanged. It does not prove arbitrary-code confinement.
 
 ### Configuration
 

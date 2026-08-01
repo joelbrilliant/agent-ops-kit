@@ -5,38 +5,26 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
-import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Sequence, Union
 
 from agent_ops.config import Config
 from agent_ops.contracts import CheckResultV1, EvidenceBundleV1
 from agent_ops.exit_codes import HELD, OK, USAGE_OR_TOOLING
-
-
-_MAX_SPEC_BYTES = 1024 * 1024
-_MAX_DEPTH = 16
-_SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
-_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}/[A-Za-z0-9_.-]{1,80}$")
-_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,79}$")
-_WRAPPERS = frozenset({"sh", "bash", "zsh", "dash", "fish", "cmd", "powershell", "pwsh", "env", "xargs", "sudo", "nohup", "timeout"})
-
-
-class QaGateUsageError(ValueError):
-    """The invocation or untrusted spec is structurally invalid."""
-
-
-@dataclass(frozen=True)
-class QaGateSpecV1:
-    repository: str
-    base_sha: str
-    criteria: Dict[str, List[str]]
-    canonical: str
+from agent_ops.qa.repository import (
+    PinnedRepository,
+    RepositorySafetyError,
+    RepositoryState,
+    canonical_identity,
+    operation_in_progress,
+    repository_state,
+    run_git,
+)
+from agent_ops.qa.spec import QaGateUsageError, parse_spec, public_identifiers_safe, safe_argv
 
 
 @dataclass(frozen=True)
@@ -48,174 +36,54 @@ class QaGateOutcome:
         return json.dumps(self.bundle.to_dict(), sort_keys=True, separators=(",", ":")) + "\n"
 
 
-def _pairs_no_duplicates(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for key, value in pairs:
-        if key in out:
-            raise QaGateUsageError("duplicate_json_key")
-        out[key] = value
-    return out
+def _bounded_path() -> str:
+    entries = []
+    for item in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        if item and os.path.isabs(item) and item not in entries:
+            candidate = os.pathsep.join([*entries, item])
+            if len(candidate) > 8192:
+                break
+            entries.append(item)
+        if len(entries) == 64:
+            break
+    return os.pathsep.join(entries) if entries else os.defpath
 
 
-def _reject_nonfinite(_: str) -> None:
-    raise QaGateUsageError("nonfinite_json_value")
-
-
-def _depth(value: Any, current: int = 0) -> int:
-    if current > _MAX_DEPTH:
-        raise QaGateUsageError("spec_too_deep")
-    if isinstance(value, dict):
-        for child in value.values():
-            _depth(child, current + 1)
-    elif isinstance(value, list):
-        for child in value:
-            _depth(child, current + 1)
-    return current
-
-
-def parse_spec(raw: Union[Mapping[str, Any], bytes, str, Path]) -> QaGateSpecV1:
-    if isinstance(raw, Path):
-        try:
-            data = raw.read_bytes()
-        except OSError as exc:
-            raise QaGateUsageError("spec_unreadable") from exc
-        return parse_spec(data)
-    if isinstance(raw, Mapping):
-        value: Any = dict(raw)
-    else:
-        data = raw.encode("utf-8") if isinstance(raw, str) else raw
-        if not isinstance(data, bytes) or len(data) > _MAX_SPEC_BYTES:
-            raise QaGateUsageError("spec_oversized_or_invalid")
-        try:
-            value = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs_no_duplicates,
-                               parse_constant=_reject_nonfinite)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise QaGateUsageError("malformed_spec") from exc
-    _depth(value)
-    if not isinstance(value, dict) or set(value) != {"schema", "schema_version", "repository", "base_sha", "criteria"}:
-        raise QaGateUsageError("invalid_spec_shape")
-    repository, base_sha, criteria = value["repository"], value["base_sha"], value["criteria"]
-    if value["schema"] != "QaGateSpecV1" or value["schema_version"] != 1:
-        raise QaGateUsageError("invalid_spec_schema")
-    if not isinstance(repository, str) or not _REPO_RE.fullmatch(repository):
-        raise QaGateUsageError("invalid_repository")
-    if not isinstance(base_sha, str) or not _SHA_RE.fullmatch(base_sha):
-        raise QaGateUsageError("invalid_base_sha")
-    if not isinstance(criteria, dict) or not criteria:
-        raise QaGateUsageError("invalid_criteria")
-    normalised: Dict[str, List[str]] = {}
-    for criterion, check_ids in criteria.items():
-        if not isinstance(criterion, str) or not _ID_RE.fullmatch(criterion):
-            raise QaGateUsageError("invalid_criterion_id")
-        if not isinstance(check_ids, list) or not check_ids or not all(isinstance(item, str) and _ID_RE.fullmatch(item) for item in check_ids):
-            raise QaGateUsageError("invalid_check_mapping")
-        if len(set(check_ids)) != len(check_ids):
-            raise QaGateUsageError("duplicate_check_mapping")
-        normalised[criterion] = sorted(check_ids)
-    canonical = json.dumps({"schema": "QaGateSpecV1", "schema_version": 1,
-                            "repository": repository, "base_sha": base_sha,
-                            "criteria": {key: normalised[key] for key in sorted(normalised)}},
-                           sort_keys=True, separators=(",", ":"))
-    return QaGateSpecV1(repository, base_sha, normalised, canonical)
-
-
-def _safe_argv(argv: Sequence[str]) -> bool:
-    if not argv or not all(isinstance(part, str) and part and not any(ord(ch) < 32 for ch in part) for part in argv):
-        return False
-    executable = Path(argv[0]).name.lower()
-    if executable in _WRAPPERS or "{" in "\n".join(argv) or "}" in "\n".join(argv):
-        return False
-    return True
-
-
-def _git(git: str, cwd: Path, *args: str, env: Mapping[str, str] | None = None) -> bytes:
-    try:
-        proc = subprocess.run([git, "-C", str(cwd), *args], capture_output=True, check=False,
-                              shell=False, env=dict(env) if env else None)
-    except OSError as exc:
-        raise RuntimeError("git_unavailable") from exc
-    if proc.returncode:
-        raise RuntimeError("git_command_failed")
-    return proc.stdout
-
-
-def _identity(git: str, path: Path, env: Mapping[str, str] | None = None) -> str:
-    raw = _git(git, path, "remote", "get-url", "origin", env=env).decode("utf-8", "strict").strip()
-    if raw.endswith(".git"):
-        raw = raw[:-4]
-    if raw.startswith("git@github.com:"):
-        raw = raw.split(":", 1)[1]
-    elif raw.startswith("https://github.com/"):
-        raw = raw.split("https://github.com/", 1)[1]
-    if not _REPO_RE.fullmatch(raw):
-        raise RuntimeError("repository_identity_invalid")
-    return raw.lower()
-
-
-def _tracked_snapshot(git: str, path: Path, env: Mapping[str, str] | None = None) -> str:
-    index = _git(git, path, "ls-files", "-s", "-z", env=env)
-    signatures: List[bytes] = [index]
-    for entry in index.split(b"\0"):
-        if not entry or b"\t" not in entry:
-            continue
-        name = entry.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")
-        target = path / name
-        try:
-            item = os.lstat(target)
-        except OSError:
-            signatures.append(b"missing:" + entry)
-            continue
-        digest = ("symlink:" + hashlib.sha256(os.readlink(target).encode("utf-8", "surrogateescape")).hexdigest() if stat.S_ISLNK(item.st_mode) else hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else "nonregular")
-        signatures.append((name + "\0" + str(stat.S_IMODE(item.st_mode)) + "\0" + str(item.st_ino) + "\0" + digest).encode())
-    return hashlib.sha256(b"\n".join(signatures)).hexdigest()
-
-
-def _state(git: str, path: Path, env: Mapping[str, str] | None = None) -> Tuple[str, str, str, str, str]:
-    head = _git(git, path, "rev-parse", "HEAD", env=env).decode().strip()
-    status = _git(git, path, "status", "--porcelain=v1", "--untracked-files=all", env=env).decode()
-    config = hashlib.sha256(_git(git, path, "config", "--local", "--null", "--list", env=env)).hexdigest()
-    hooks = _git(git, path, "rev-parse", "--git-path", "hooks", env=env).decode().strip()
-    actual_hooks = str(Path(_git(git, path, "rev-parse", "--absolute-git-dir", env=env).decode().strip()) / "hooks")
-    hooks_path = (path / hooks).resolve() if not os.path.isabs(hooks) else Path(hooks)
-    actual_hooks_path = (path / actual_hooks).resolve() if not os.path.isabs(actual_hooks) else Path(actual_hooks)
-    hook_rows: List[bytes] = []
-    for root in {hooks_path, actual_hooks_path}:
-        if root.exists() and root.is_dir():
-            for item in sorted(root.rglob("*")):
-                if item.is_file():
-                    hook_rows.append(item.relative_to(root).as_posix().encode() + b":" + hashlib.sha256(item.read_bytes()).digest())
-    return head, status, _tracked_snapshot(git, path, env), config, hashlib.sha256(b"\n".join(hook_rows)).hexdigest()
-
-
-def _source_ready(git: str, source: Path, spec: QaGateSpecV1) -> Tuple[bool, str, Tuple[str, str, str, str, str] | None]:
-    if source.is_symlink() or not source.is_dir():
-        return False, "source_path_unsafe", None
-    try:
-        if _identity(git, source) != spec.repository.lower():
-            return False, "repository_identity_mismatch", None
-        current = _state(git, source)
-        if current[0] != spec.base_sha:
-            return False, "base_sha_mismatch", None
-        if current[1]:
-            return False, "source_not_clean", None
-        for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"):
-            marker_path = _git(git, source, "rev-parse", "--git-path", marker).decode().strip()
-            marker_file = Path(marker_path) if os.path.isabs(marker_path) else source / marker_path
-            if marker_file.exists():
-                return False, "git_operation_in_progress", None
-        return True, "", current
-    except (RuntimeError, UnicodeError):
-        return False, "source_not_git_worktree", None
-
-
-def _check_env() -> Dict[str, str]:
-    keep = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL", "TMPDIR") if os.environ.get(key)}
-    keep.update({"HOME": tempfile.mkdtemp(prefix="agent-ops-qa-home-"), "GIT_CONFIG_NOSYSTEM": "1",
-                 "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": os.devnull,
-                 "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "",
-                 "GIT_CONFIG_KEY_1": "core.hooksPath", "GIT_CONFIG_VALUE_1": os.devnull,
-                 "GH_CONFIG_DIR": tempfile.mkdtemp(prefix="agent-ops-qa-gh-"), "XDG_CONFIG_HOME": tempfile.mkdtemp(prefix="agent-ops-qa-xdg-")})
-    return keep
+def _check_env(root: Path) -> Dict[str, str]:
+    locale = os.environ.get("LC_ALL") or os.environ.get("LANG") or "C"
+    if len(locale) > 128 or any(ord(character) < 32 for character in locale):
+        locale = "C"
+    env = {
+        "PATH": _bounded_path(),
+        "LANG": locale,
+        "LC_ALL": locale,
+        "HOME": str(root / "home"),
+        "TMPDIR": str(root / "tmp"),
+        "GH_CONFIG_DIR": str(root / "gh"),
+        "XDG_CONFIG_HOME": str(root / "xdg"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": os.devnull,
+        "GIT_ALLOW_PROTOCOL": "file",
+        "GIT_CEILING_DIRECTORIES": str(root),
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_KEY_1": "core.hooksPath",
+        "GIT_CONFIG_VALUE_1": os.devnull,
+        "PIP_NO_INDEX": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "UV_OFFLINE": "1",
+        "CARGO_NET_OFFLINE": "true",
+        "npm_config_offline": "true",
+        "npm_config_update_notifier": "false",
+        "HTTP_PROXY": "http://127.0.0.1:9",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "ALL_PROXY": "http://127.0.0.1:9",
+        "NO_PROXY": "",
+    }
+    return env
 
 
 def _result(check_id: str, sha: str, status: str, summary: str, refs: List[str]) -> CheckResultV1:
@@ -229,7 +97,89 @@ def _bundle(spec_text: str, sha: str, checks: List[CheckResultV1], verdict: str)
                             checks=checks, verdict=verdict,
                             redaction_record={"raw_output_excluded": True, "commands_excluded": True,
                                               "paths_excluded": True, "credentials_excluded": True,
-                                              "repository_contents_excluded": True})
+                                              "repository_contents_excluded": True,
+                                              "relative_path_source_isolation": True,
+                                              "operating_system_sandbox": False,
+                                              "absolute_path_confinement": False,
+                                              "raw_socket_confinement": False})
+
+
+def _source_ready(
+    git: str,
+    source: PinnedRepository,
+    repository: str,
+    base_sha: str,
+    env: Mapping[str, str],
+) -> tuple[bool, str, RepositoryState | None]:
+    if not source.still_bound():
+        return False, "source_path_changed", None
+    try:
+        inside = run_git(
+            git,
+            source.command_path,
+            "rev-parse",
+            "--is-inside-work-tree",
+            env=env,
+            pass_fds=source.pass_fds,
+        ).strip()
+        if inside != b"true":
+            return False, "source_not_git_worktree", None
+        if canonical_identity(git, source.command_path, env, source.pass_fds) != repository.casefold():
+            return False, "repository_identity_mismatch", None
+        head = run_git(
+            git, source.command_path, "rev-parse", "HEAD", env=env, pass_fds=source.pass_fds
+        ).decode("ascii", "strict").strip()
+        if head != base_sha:
+            return False, "base_sha_mismatch", None
+        status = run_git(
+            git,
+            source.command_path,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            env=env,
+            pass_fds=source.pass_fds,
+        )
+        if status:
+            return False, "source_not_clean", None
+        if operation_in_progress(git, source.command_path, env, source.pass_fds):
+            return False, "git_operation_in_progress", None
+        current = repository_state(git, source.command_path, env, source.pass_fds)
+        if current.head != head or current.status != status:
+            return False, "source_changed_during_snapshot", None
+        if not source.still_bound():
+            return False, "source_path_changed", None
+        return True, "", current
+    except RepositorySafetyError as exc:
+        if exc.code == "tracked_symlink_escapes_clone":
+            return False, exc.code, None
+        return False, "source_not_git_worktree", None
+    except UnicodeError:
+        return False, "source_not_git_worktree", None
+
+
+def _create_workspace() -> Path:
+    return Path(tempfile.mkdtemp(prefix="agent-ops-qa-"))
+
+
+def _set_repository_hold(checks: List[CheckResultV1], sha: str, code: str) -> None:
+    existing = checks[0]
+    refs = list(existing.evidence_refs)
+    marker = "hold_code=" + code
+    if marker not in refs:
+        refs.append(marker)
+    summary = code if existing.status == "PASS" or existing.summary == "source_preflight_failed" else existing.summary
+    checks[0] = _result("repository-state", sha, "HOLD", summary, refs)
+
+
+def _process_refs(criteria: Sequence[str], return_code: int, stdout: bytes, stderr: bytes) -> List[str]:
+    return [
+        "criteria=" + ",".join(sorted(criteria)),
+        "return_code=" + str(return_code),
+        "stdout_bytes=" + str(len(stdout)),
+        "stderr_bytes=" + str(len(stderr)),
+        "output_sha256=" + hashlib.sha256(stdout + stderr).hexdigest(),
+    ]
 
 
 def run_gate(config: Config, repository: Union[str, Path], raw_spec: Union[Mapping[str, Any], bytes, str, Path]) -> QaGateOutcome:
@@ -250,66 +200,201 @@ def run_gate(config: Config, repository: Union[str, Path], raw_spec: Union[Mappi
     for criterion, check_ids in spec.criteria.items():
         for check_id in check_ids:
             check_to_criteria.setdefault(check_id, []).append(criterion)
-    if any(check not in commands or not _safe_argv(commands[check]) for check in check_to_criteria):
+    if (
+        not public_identifiers_safe(spec.criteria, config.private_markers)
+        or any(check not in commands or not safe_argv(commands[check]) for check in check_to_criteria)
+    ):
         check = _result("repository-state", spec.base_sha, "HOLD", "invalid_trusted_check", [])
         return QaGateOutcome(USAGE_OR_TOOLING, _bundle(spec.canonical, spec.base_sha, [check], "HOLD"))
-    ready, code, source_before = _source_ready(config.git_command, source, spec)
-    if not ready:
-        check = _result("repository-state", spec.base_sha, "HOLD", code, [])
-        return QaGateOutcome(HELD, _bundle(spec.canonical, spec.base_sha, [check], "HOLD"))
-    state_check = _result("repository-state", spec.base_sha, "PASS", "source_bound", ["state_digest=sha256:" + hashlib.sha256(repr(source_before).encode()).hexdigest()])
-    checks: List[CheckResultV1] = [state_check]
-    clone_root = Path(tempfile.mkdtemp(prefix="agent-ops-qa-clone-"))
-    clone = clone_root / "repository"
-    env = _check_env()
+    checks: List[CheckResultV1] = [
+        _result("repository-state", spec.base_sha, "HOLD", "source_preflight_failed", [])
+    ]
+    workspace: Path | None = None
+    pinned: PinnedRepository | None = None
+    source_before: RepositoryState | None = None
     verdict = "PASS"
     try:
-        clone_proc = subprocess.run([config.git_command, "clone", "--no-hardlinks", "--no-local", "--no-checkout", str(source), str(clone)],
-                                    capture_output=True, check=False, shell=False, env=env)
+        workspace = _create_workspace()
+        os.chmod(workspace, 0o700)
+        for name in ("home", "tmp", "gh", "xdg", "clone"):
+            (workspace / name).mkdir(mode=0o700)
+        env = _check_env(workspace)
+        try:
+            pinned = PinnedRepository.open(source)
+        except RepositorySafetyError as exc:
+            _set_repository_hold(checks, spec.base_sha, exc.code)
+            raise RepositorySafetyError("source_preflight_failed") from exc
+        ready, code, source_before = _source_ready(
+            config.git_command, pinned, spec.repository, spec.base_sha, env
+        )
+        if not ready or source_before is None:
+            _set_repository_hold(checks, spec.base_sha, code)
+            verdict = "HOLD"
+            raise RepositorySafetyError("source_preflight_failed")
+        checks[0] = _result(
+            "repository-state",
+            spec.base_sha,
+            "PASS",
+            "source_bound",
+            ["state_digest=sha256:" + source_before.evidence_digest()],
+        )
+        clone = workspace / "clone" / "repository"
+
+        def enter_pinned_source() -> None:
+            os.fchdir(pinned.fd)
+
+        clone_proc = subprocess.run(
+            [
+                config.git_command,
+                "clone",
+                "--no-hardlinks",
+                "--no-local",
+                "--no-checkout",
+                "--",
+                ".",
+                str(clone),
+            ],
+            capture_output=True,
+            check=False,
+            shell=False,
+            env=env,
+            pass_fds=pinned.pass_fds,
+            preexec_fn=enter_pinned_source,
+        )
         if clone_proc.returncode:
-            raise RuntimeError("clone_failed")
-        subprocess.run([config.git_command, "-C", str(clone), "remote", "set-url", "origin", "https://github.com/" + spec.repository + ".git"], capture_output=True, check=True, shell=False, env=env)
-        if _identity(config.git_command, clone, env) != spec.repository.lower():
-            raise RuntimeError("clone_identity_mismatch")
-        subprocess.run([config.git_command, "-C", str(clone), "checkout", "--detach", spec.base_sha], capture_output=True,
-                       check=True, shell=False, env=env)
-        clone_before = _state(config.git_command, clone, env)
-        if clone_before[0] != spec.base_sha or clone_before[1]:
-            raise RuntimeError("clone_not_clean")
+            raise RepositorySafetyError("clone_failed")
+        run_git(
+            config.git_command,
+            clone,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/" + spec.repository + ".git",
+            env=env,
+        )
+        if canonical_identity(config.git_command, clone, env) != spec.repository.casefold():
+            raise RepositorySafetyError("clone_identity_mismatch")
+        run_git(config.git_command, clone, "checkout", "--detach", spec.base_sha, env=env)
+        clone_before = repository_state(config.git_command, clone, env)
+        if clone_before.head != spec.base_sha or clone_before.status:
+            raise RepositorySafetyError("clone_not_clean")
         for check_id in sorted(check_to_criteria):
             argv = commands[check_id]
-            proc = subprocess.run(argv, cwd=str(clone), capture_output=True, check=False, shell=False, env=env)
-            out_digest = hashlib.sha256(proc.stdout + proc.stderr).hexdigest()
-            refs = ["criteria=" + ",".join(sorted(check_to_criteria[check_id])), "return_code=" + str(proc.returncode),
-                    "stdout_bytes=" + str(len(proc.stdout)), "stderr_bytes=" + str(len(proc.stderr)),
-                    "output_sha256=" + out_digest]
-            clone_after = _state(config.git_command, clone, env)
-            if proc.returncode:
-                checks.append(_result(check_id, spec.base_sha, "HOLD", "exit=" + str(proc.returncode), refs))
+            precheck_refs = _process_refs(check_to_criteria[check_id], -1, b"", b"")
+            try:
+                clone_precheck = repository_state(config.git_command, clone, env)
+                before_identity = canonical_identity(config.git_command, clone, env)
+            except RepositorySafetyError:
+                clone_precheck = None
+                before_identity = ""
+            if (
+                clone_precheck is None
+                or before_identity != spec.repository.casefold()
+                or clone_precheck.mutation_key() != clone_before.mutation_key()
+            ):
+                checks.append(_result(check_id, spec.base_sha, "HOLD", "clone_mutation", precheck_refs))
                 verdict = "HOLD"
                 break
-            if (clone_after[0], clone_after[2], clone_after[3], clone_after[4]) != (clone_before[0], clone_before[2], clone_before[3], clone_before[4]):
+            source_precheck_ready, source_precheck_code, source_precheck = _source_ready(
+                config.git_command, pinned, spec.repository, spec.base_sha, env
+            )
+            if not source_precheck_ready or source_precheck != source_before:
+                _set_repository_hold(
+                    checks,
+                    spec.base_sha,
+                    source_precheck_code if not source_precheck_ready else "source_mutation",
+                )
+                checks.append(_result(check_id, spec.base_sha, "HOLD", "source_mutation", precheck_refs))
+                verdict = "HOLD"
+                break
+            try:
+                proc = subprocess.run(
+                    argv,
+                    cwd=str(clone),
+                    capture_output=True,
+                    check=False,
+                    shell=False,
+                    env=env,
+                    timeout=config.runner_timeout_seconds,
+                )
+                return_code = proc.returncode
+                stdout = proc.stdout
+                stderr = proc.stderr
+                summary = "exit=" + str(return_code)
+            except subprocess.TimeoutExpired as exc:
+                return_code = -1
+                stdout = exc.stdout if isinstance(exc.stdout, bytes) else b""
+                stderr = exc.stderr if isinstance(exc.stderr, bytes) else b""
+                summary = "check_timeout"
+            except OSError:
+                return_code = -1
+                stdout = b""
+                stderr = b""
+                summary = "check_start_failure"
+            refs = _process_refs(check_to_criteria[check_id], return_code, stdout, stderr)
+            try:
+                clone_after = repository_state(config.git_command, clone, env)
+                clone_identity = canonical_identity(config.git_command, clone, env)
+                clone_mutated = (
+                    clone_identity != spec.repository.casefold()
+                    or clone_after.mutation_key() != clone_before.mutation_key()
+                )
+            except RepositorySafetyError:
+                clone_mutated = True
+            source_ready, source_code, source_after = _source_ready(
+                config.git_command, pinned, spec.repository, spec.base_sha, env
+            )
+            source_mutated = not source_ready or source_after != source_before
+            if source_mutated:
+                _set_repository_hold(
+                    checks,
+                    spec.base_sha,
+                    source_code if not source_ready else "source_mutation",
+                )
+            if clone_mutated:
                 checks.append(_result(check_id, spec.base_sha, "HOLD", "clone_mutation", refs))
+                verdict = "HOLD"
+                break
+            if source_mutated:
+                checks.append(_result(check_id, spec.base_sha, "HOLD", "source_mutation", refs))
+                verdict = "HOLD"
+                break
+            if return_code:
+                checks.append(_result(check_id, spec.base_sha, "HOLD", summary, refs))
                 verdict = "HOLD"
                 break
             checks.append(_result(check_id, spec.base_sha, "PASS", "exit=0", refs))
         if verdict == "PASS" and len(checks) != len(check_to_criteria) + 1:
             verdict = "HOLD"
-    except (OSError, RuntimeError, subprocess.SubprocessError):
-        checks.append(_result("repository-state", spec.base_sha, "HOLD", "clone_or_git_failure", []))
+        if pinned is not None and source_before is not None:
+            ready_after, after_code, source_after = _source_ready(
+                config.git_command, pinned, spec.repository, spec.base_sha, env
+            )
+            if not ready_after or source_after != source_before:
+                _set_repository_hold(
+                    checks,
+                    spec.base_sha,
+                    after_code if not ready_after else "source_mutation",
+                )
+                verdict = "HOLD"
+    except (OSError, RepositorySafetyError, subprocess.SubprocessError) as exc:
+        if isinstance(exc, RepositorySafetyError) and exc.code == "source_preflight_failed":
+            pass
+        else:
+            _set_repository_hold(checks, spec.base_sha, "clone_or_git_failure")
         verdict = "HOLD"
     finally:
+        if pinned is not None:
+            pinned.close()
         cleanup_failed = False
-        for item in [env.get("HOME"), env.get("GH_CONFIG_DIR"), env.get("XDG_CONFIG_HOME"), str(clone_root)]:
+        if workspace is not None:
             try:
-                shutil.rmtree(str(item))
+                shutil.rmtree(workspace)
             except OSError:
                 cleanup_failed = True
+            if os.path.lexists(workspace):
+                cleanup_failed = True
         if cleanup_failed:
-            checks.append(_result("repository-state", spec.base_sha, "HOLD", "cleanup_failed", []))
+            _set_repository_hold(checks, spec.base_sha, "cleanup_failed")
             verdict = "HOLD"
-    ready_after, after_code, source_after = _source_ready(config.git_command, source, spec)
-    if not ready_after or source_after != source_before:
-        checks[0] = _result("repository-state", spec.base_sha, "HOLD", after_code if not ready_after else "source_mutation", [])
-        verdict = "HOLD"
     return QaGateOutcome(OK if verdict == "PASS" else HELD, _bundle(spec.canonical, spec.base_sha, checks, verdict))

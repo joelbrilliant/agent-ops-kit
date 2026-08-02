@@ -1,5 +1,6 @@
 {
   "github_login": "joelbrilliant",
+  "github_executable": "/opt/homebrew/bin/gh",
   "allowed_namespaces": ["joelbrilliant"],
   "state_dir": "/Users/openclaw/.local/state/github-watch",
   "worktree_root": "/Users/openclaw/.local/state/github-watch/worktrees",

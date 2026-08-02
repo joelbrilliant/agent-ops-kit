@@ -13,6 +13,7 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _CHANNEL = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _KEYS = {
     "github_login",
+    "github_executable",
     "allowed_namespaces",
     "state_dir",
     "worktree_root",
@@ -32,6 +33,7 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class Config:
     github_login: str
+    github_executable: str
     allowed_namespaces: tuple[str, ...]
     state_dir: Path
     worktree_root: Path
@@ -56,6 +58,7 @@ def load_config(path: str | Path) -> Config:
         raise ConfigError("configuration must contain exactly the documented keys")
     return Config(
         github_login=_name(value, "github_login"),
+        github_executable=_executable(value, "github_executable"),
         allowed_namespaces=_names(value.get("allowed_namespaces")),
         state_dir=_path(value, "state_dir"),
         worktree_root=_path(value, "worktree_root"),

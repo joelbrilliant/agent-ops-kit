@@ -14,6 +14,7 @@ from github_watch.worker import WorkerResult
 def config(tmp_path: Path) -> Config:
     return Config(
         github_login="joelbrilliant",
+        github_executable="/opt/homebrew/bin/gh",
         allowed_namespaces=("acme",),
         state_dir=tmp_path / "state",
         worktree_root=tmp_path / "worktrees",

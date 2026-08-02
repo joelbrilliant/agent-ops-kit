@@ -64,6 +64,7 @@ class GitHub:
 
     def __init__(self, config: Config | None = None, runner: Runner = subprocess.run) -> None:
         self.config = config
+        self.executable = config.github_executable if config is not None else "gh"
         self.runner = runner
 
     def list_notifications(self, limit: int) -> list[Notification]:
@@ -98,7 +99,7 @@ class GitHub:
         current = self._get(f"/notifications/threads/{notification_id}")
         if not isinstance(current, dict) or self._text(current.get("updated_at")) != expected_updated_at:
             raise StaleNotification("notification changed before mark-read")
-        self._call(["gh", "api", "--method", "PATCH", f"/notifications/threads/{notification_id}"])
+        self._call([self.executable, "api", "--method", "PATCH", f"/notifications/threads/{notification_id}"])
 
     def verify_completion(self, item: ResolvedNotification, result: WorkerResult) -> bool:
         if result.head_sha is None or result.comment_kind is None or result.comment_id is None:
@@ -202,7 +203,7 @@ class GitHub:
         return self._text(payload.get("body")) if isinstance(payload, dict) else None
 
     def _get(self, endpoint: str) -> Any:
-        return self._json(self._call(["gh", "api", "--method", "GET", endpoint]))
+        return self._json(self._call([self.executable, "api", "--method", "GET", endpoint]))
 
     def _call(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         try:

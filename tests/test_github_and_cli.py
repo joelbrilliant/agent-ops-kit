@@ -16,6 +16,7 @@ def test_production_shaped_inspect_parses_notifications_without_mutation(config,
         json.dumps(
             {
                 "github_login": config.github_login,
+                "github_executable": config.github_executable,
                 "allowed_namespaces": list(config.allowed_namespaces),
                 "state_dir": str(config.state_dir),
                 "worktree_root": str(config.worktree_root),
@@ -146,14 +147,14 @@ def test_real_api_shaped_check_resolution_and_completion_verification_use_fixed_
     assert github.head_is_green(resolved) is True
     assert github.verify_completion(resolved, WorkerResult.completed("fixed", "new-head", "issue", 44)) is True
     assert calls == [
-        ["gh", "api", "--method", "GET", "/notifications?all=false&participating=false&per_page=20"],
-        ["gh", "api", "--method", "GET", "/repos/acme/widget/check-suites/50"],
-        ["gh", "api", "--method", "GET", "/repos/acme/widget/pulls/7"],
-        ["gh", "api", "--method", "GET", "/repos/acme/widget/issues/comments/43"],
-        ["gh", "api", "--method", "GET", "/repos/acme/widget/commits/old-head/check-runs?per_page=100"],
-        ["gh", "api", "--method", "GET", "/repos/acme/widget/commits/old-head/status"],
-        ["gh", "api", "--method", "GET", "/repos/acme/widget/pulls/7"],
-        ["gh", "api", "--method", "GET", "/repos/acme/widget/issues/comments/44"],
+        [config.github_executable, "api", "--method", "GET", "/notifications?all=false&participating=false&per_page=20"],
+        [config.github_executable, "api", "--method", "GET", "/repos/acme/widget/check-suites/50"],
+        [config.github_executable, "api", "--method", "GET", "/repos/acme/widget/pulls/7"],
+        [config.github_executable, "api", "--method", "GET", "/repos/acme/widget/issues/comments/43"],
+        [config.github_executable, "api", "--method", "GET", "/repos/acme/widget/commits/old-head/check-runs?per_page=100"],
+        [config.github_executable, "api", "--method", "GET", "/repos/acme/widget/commits/old-head/status"],
+        [config.github_executable, "api", "--method", "GET", "/repos/acme/widget/pulls/7"],
+        [config.github_executable, "api", "--method", "GET", "/repos/acme/widget/issues/comments/44"],
     ]
 
 
@@ -304,7 +305,7 @@ def test_mark_read_requires_the_same_notification_update(config):
         github.mark_read("thread-1", "2026-08-02T00:00:00Z")
 
     assert calls[0][-1] == "/notifications/threads/thread-1"
-    assert calls[1] == ["gh", "api", "--method", "PATCH", "/notifications/threads/thread-1"]
+    assert calls[1] == [config.github_executable, "api", "--method", "PATCH", "/notifications/threads/thread-1"]
 
 
 def test_green_head_rejects_truncated_commit_statuses(config):
@@ -353,7 +354,7 @@ def test_joel_authored_upstream_pr_is_supported_without_an_allowed_base_namespac
 
     assert notification is not None
     assert notification.mutation_allowed is True
-    assert calls == [["gh", "api", "--method", "GET", "/repos/NousResearch/hermes-agent/pulls/74993"]]
+    assert calls == [[config.github_executable, "api", "--method", "GET", "/repos/NousResearch/hermes-agent/pulls/74993"]]
 
 
 def test_non_authored_pr_outside_allowed_namespace_is_read_only_triage(config):
@@ -385,7 +386,7 @@ def test_non_authored_pr_outside_allowed_namespace_is_read_only_triage(config):
 
     assert notification is not None
     assert notification.mutation_allowed is False
-    assert calls == [["gh", "api", "--method", "GET", "/repos/NousResearch/hermes-agent/pulls/74994"]]
+    assert calls == [[config.github_executable, "api", "--method", "GET", "/repos/NousResearch/hermes-agent/pulls/74994"]]
 
 
 def test_non_authored_pr_needs_allowed_namespace_and_push_permission(config):
@@ -423,7 +424,7 @@ def test_non_authored_pr_needs_allowed_namespace_and_push_permission(config):
 
     assert resolved is not None
     assert resolved.mutation_allowed is True
-    assert calls[-1] == ["gh", "api", "--method", "GET", "/repos/acme/widget"]
+    assert calls[-1] == [config.github_executable, "api", "--method", "GET", "/repos/acme/widget"]
 
 
 def test_live_shaped_participated_non_owned_notification_resolves_with_parent_context(config):

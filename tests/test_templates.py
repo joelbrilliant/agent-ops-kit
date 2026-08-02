@@ -37,6 +37,7 @@ def test_config_template_validates_and_packaged_sandbox_denies_gui_execution():
 
     assert config.batch_limit == 20
     assert config.max_notification_age_hours == 168
+    assert config.github_executable == "/opt/homebrew/bin/gh"
     assert "(deny process-exec (literal \"/usr/bin/open\"))" in sandbox
     assert "[.]app/Contents/MacOS" in sandbox
     readonly = resources.files("github_watch").joinpath("templates/oscar-readonly.sb").read_text(encoding="utf-8")

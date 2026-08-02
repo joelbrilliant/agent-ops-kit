@@ -40,6 +40,8 @@ def test_config_template_validates_and_packaged_sandbox_denies_gui_execution():
     assert config.github_executable == "/opt/homebrew/bin/gh"
     assert "(deny process-exec (literal \"/usr/bin/open\"))" in sandbox
     assert "[.]app/Contents/MacOS" in sandbox
+    assert '(deny file-read* file-write* (subpath "/Users/openclaw/Projects"))' in sandbox
+    assert '(allow file-read* (literal "/Users/openclaw/Projects/FILESYSTEM.md"))' in sandbox
     readonly = resources.files("github_watch").joinpath("templates/oscar-readonly.sb").read_text(encoding="utf-8")
     assert "/Users/openclaw/.config/gh" in readonly
     assert "/usr/bin/security" in readonly

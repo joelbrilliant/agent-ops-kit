@@ -2,6 +2,8 @@
 (allow default)
 (deny process-exec (literal "/usr/bin/open"))
 (deny process-exec (regex #".*[.]app/Contents/MacOS/.*"))
+(deny file-read* file-write* (subpath "/Users/openclaw/Projects"))
+(allow file-read* (literal "/Users/openclaw/Projects/FILESYSTEM.md"))
 (deny file-read* file-write* (subpath "/Users/openclaw/.ssh"))
 (deny file-read* file-write* (subpath "/Users/openclaw/.aws"))
 (deny file-read* file-write* (subpath "/Users/openclaw/.gnupg"))

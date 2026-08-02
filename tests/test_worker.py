@@ -111,6 +111,19 @@ def test_worker_accepts_only_one_valid_json_object(config):
     assert result.comment_id == 4
 
 
+def test_worker_accepts_minimal_no_action_result(config):
+    item = note()
+
+    result = OscarWorker(
+        config,
+        runner=git_runner,
+        process_factory=lambda *a, **k: FinishedProcess('{"outcome":"no_action"}'),
+    ).run(resolved(item))
+
+    assert result.outcome == "no_action"
+    assert result.summary == "No action needed"
+
+
 def test_read_only_worker_strips_credentials_and_receives_parent_context(config, monkeypatch):
     item = note()
     item = item.__class__(

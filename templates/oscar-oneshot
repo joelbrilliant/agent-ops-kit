@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  exit 64
+fi
+
+export HERMES_HOME=/Users/openclaw/.hermes/profiles/oscar
+exec /Users/openclaw/.local/bin/hermes --oneshot "$1"

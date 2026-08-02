@@ -1,0 +1,13 @@
+{
+  "github_login": "joelbrilliant",
+  "github_executable": "/opt/homebrew/bin/gh",
+  "allowed_namespaces": ["joelbrilliant"],
+  "state_dir": "/Users/openclaw/.local/state/github-watch",
+  "worktree_root": "/Users/openclaw/.local/state/github-watch/worktrees",
+  "oscar_command": "/Users/openclaw/.hermes/profiles/oscar/bin/github-watch-oscar-oneshot",
+  "oscar_timeout_seconds": 900,
+  "buzz_channel": "00000000-0000-0000-0000-000000000000",
+  "buzz_executable": "/Users/openclaw/.local/bin/github-watch-buzz-notify",
+  "batch_limit": 20,
+  "max_notification_age_hours": 168
+}

@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Send one accepted Buzz message with only local BUZZ credentials."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+ENV_PATH = Path(os.environ.get("BUZZ_ENV_FILE", "/Users/openclaw/.config/github-watch/buzz.env"))
+DEFAULT_BUZZ = "/Users/openclaw/.local/bin/buzz"
+KEY = re.compile(r"^BUZZ_[A-Z0-9_]+$")
+
+
+def load_buzz_env(path: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if not KEY.fullmatch(key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        result[key] = value
+    return result
+
+
+def main() -> int:
+    if len(sys.argv) not in {2, 3} or not sys.argv[1].strip():
+        return 64
+    try:
+        buzz_env = load_buzz_env(ENV_PATH)
+    except OSError:
+        return 1
+    channel = sys.argv[2] if len(sys.argv) == 3 else buzz_env.get("BUZZ_CHANNEL_UUID", "")
+    if not channel:
+        return 64
+    child_env = {
+        "PATH": "/Users/openclaw/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": "/Users/openclaw",
+        "LANG": "en_AU.UTF-8",
+        "LC_ALL": "en_AU.UTF-8",
+        "HERMES_HOME": "/Users/openclaw/.hermes",
+        **buzz_env,
+    }
+    try:
+        sent = subprocess.run(
+            [DEFAULT_BUZZ, "messages", "send", "--channel", channel, "--content", sys.argv[1]],
+            env=child_env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        payload = json.loads(sent.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return 1
+    return 0 if sent.returncode == 0 and isinstance(payload, dict) and payload.get("accepted") is True else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

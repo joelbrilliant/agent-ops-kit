@@ -24,6 +24,7 @@ def test_production_shaped_inspect_parses_notifications_without_mutation(config,
                 "buzz_channel": config.buzz_channel,
                 "buzz_executable": config.buzz_executable,
                 "batch_limit": config.batch_limit,
+                "max_notification_age_hours": config.max_notification_age_hours,
             }
         )
     )

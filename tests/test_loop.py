@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from github_watch.github import Notification, PullRequest, ResolvedNotification
@@ -10,9 +12,54 @@ from github_watch.worker import WorkerResult
 from .conftest import FakeBuzz, FakeGitHub, FakeWorker, note, resolved
 
 
+TEST_NOW = datetime(2026, 8, 3, tzinfo=UTC)
+
+
+def watch_loop(config, github, worker, state, buzz_send=None):
+    return WatchLoop(
+        config,
+        github,
+        worker,
+        state,
+        buzz_send=buzz_send,
+        now=lambda: TEST_NOW,
+    )
+
+
 def run_loop(config, github, worker, buzz):
     state = StateStore(config.state_dir)
-    return WatchLoop(config, github, worker, state, buzz_send=buzz).run(), state
+    return watch_loop(config, github, worker, state, buzz_send=buzz).run(), state
+
+
+def test_old_notification_is_retired_without_resolution_oscar_or_buzz(config):
+    item = note(updated_at="2026-07-01T00:00:00Z")
+    github = FakeGitHub([item], {})
+    worker = FakeWorker()
+    buzz = FakeBuzz()
+
+    result, store = run_loop(config, github, worker, buzz)
+
+    row = store.get(item.notification_id, item.updated_at)
+    assert result.processed == 1
+    assert github.calls == [
+        ("list", str(config.batch_limit)),
+        ("mark", item.notification_id),
+    ]
+    assert worker.calls == []
+    assert buzz.messages == []
+    assert row.outcome == "no_action"
+    assert row.read_completed is True
+    assert row.buzz_completed is True
+
+
+def test_notification_within_cutoff_still_reaches_oscar(config):
+    item = note(updated_at="2026-08-02T00:00:00Z")
+    github = FakeGitHub([item], {item.notification_id: resolved(item)})
+    worker = FakeWorker(WorkerResult.no_action("already handled"))
+
+    run_loop(config, github, worker, FakeBuzz())
+
+    assert worker.calls == [item.notification_id]
 
 
 @pytest.mark.parametrize("state,merged", [("closed", False), ("open", True)])
@@ -67,7 +114,7 @@ def test_ambiguous_supported_notification_is_blocked_once_and_remains_unread(con
     worker = FakeWorker()
     buzz = FakeBuzz()
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     loop.run()
@@ -89,7 +136,7 @@ def test_resolution_failure_is_deduplicated_blocked_work(config):
     worker = FakeWorker()
     buzz = FakeBuzz()
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     loop.run()
@@ -253,7 +300,7 @@ def test_repeated_same_notification_update_does_not_repeat_actions(config):
     worker = FakeWorker(WorkerResult.no_action("not needed"))
     buzz = FakeBuzz()
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     first_calls = list(github.calls)
@@ -320,7 +367,7 @@ def test_blocked_same_pr_notifications_do_not_repeat_worker_or_buzz(config):
     )
     buzz = FakeBuzz()
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     loop.run()
@@ -343,7 +390,7 @@ def test_new_notification_in_later_poll_still_gets_live_triage(config):
     )
     buzz = FakeBuzz()
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     second = note("thread-second", "2026-08-02T02:00:00Z")
@@ -367,7 +414,7 @@ def test_newer_completed_work_supersedes_an_older_blocked_notification(config):
     )
     buzz = FakeBuzz()
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     older_item = resolved(older, head_sha="head-2")
@@ -397,7 +444,7 @@ def test_same_notification_update_with_changed_head_does_not_repeat_actions(conf
     worker = FakeWorker(WorkerResult.blocked("manual check", "inspect the pull request"))
     buzz = FakeBuzz()
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     github.resolutions[item.notification_id] = resolved(item, head_sha="new-head")
@@ -430,7 +477,7 @@ def test_failed_mark_read_retries_only_mark_read(config):
     worker = FakeWorker(WorkerResult.no_action("not needed"))
     buzz = FakeBuzz()
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     loop.run()
@@ -450,7 +497,7 @@ def test_failed_buzz_retries_only_buzz(config):
     buzz = FakeBuzz()
     buzz.failures = 1
     store = StateStore(config.state_dir)
-    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+    loop = watch_loop(config, github, worker, store, buzz_send=buzz)
 
     loop.run()
     loop.run()
@@ -470,7 +517,13 @@ def test_concurrent_invocation_exits_quietly_while_os_lock_is_held(config):
     holder = StateStore(config.state_dir)
     assert holder.lock.acquire() is True
 
-    result = WatchLoop(config, github, worker, StateStore(config.state_dir), buzz_send=buzz).run()
+    result = watch_loop(
+        config,
+        github,
+        worker,
+        StateStore(config.state_dir),
+        buzz_send=buzz,
+    ).run()
 
     holder.lock.release()
     assert result.locked is True

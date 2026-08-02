@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import subprocess
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Callable
 
 from .config import Config
@@ -30,12 +31,14 @@ class WatchLoop:
         worker: OscarWorker,
         state: StateStore,
         buzz_send: Callable[[str], None] | None = None,
+        now: Callable[[], datetime] | None = None,
     ) -> None:
         self.config = config
         self.github = github
         self.worker = worker
         self.state = state
         self.buzz_send = buzz_send or self._send_buzz
+        self.now = now or (lambda: datetime.now(UTC))
 
     def run(self) -> RunResult:
         if not self.state.lock.acquire():
@@ -55,6 +58,11 @@ class WatchLoop:
             )
             handled_pulls: dict[tuple[str, int], StateRow] = {}
             for notification in notifications:
+                if self._aged_out(notification.updated_at):
+                    processed += 1
+                    self.state.record_aged_out(notification)
+                    self._drain_pending()
+                    continue
                 try:
                     item = self.github.resolve(notification)
                 except Exception:
@@ -103,6 +111,21 @@ class WatchLoop:
             return RunResult(processed=processed)
         finally:
             self.state.lock.release()
+
+    def _aged_out(self, updated_at: str) -> bool:
+        try:
+            timestamp = datetime.fromisoformat(updated_at)
+        except (TypeError, ValueError):
+            return False
+        if timestamp.tzinfo is None:
+            return False
+        now = self.now()
+        if now.tzinfo is None:
+            return False
+        cutoff = now.astimezone(UTC) - timedelta(
+            hours=self.config.max_notification_age_hours,
+        )
+        return timestamp < cutoff
 
     def _obsolete(self, item: ResolvedNotification) -> bool:
         if item.pull.state == "closed" or item.pull.merged:

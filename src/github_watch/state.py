@@ -156,6 +156,35 @@ class StateStore:
         )
         self.connection.commit()
 
+    def record_aged_out(self, item: Notification) -> None:
+        """Retire an old unread notification without launching Oscar or Buzz."""
+        self.connection.execute(
+            """
+            INSERT INTO notifications
+            (notification_id, source_updated_at, repository, pull_number, head_sha,
+             outcome, read_completed, buzz_completed, message, last_error, updated_at)
+            VALUES (?, ?, ?, ?, '', 'no_action', 0, 1, NULL, NULL, ?)
+            ON CONFLICT(notification_id, source_updated_at) DO UPDATE SET
+              repository = excluded.repository,
+              pull_number = excluded.pull_number,
+              head_sha = '',
+              outcome = 'no_action',
+              read_completed = 0,
+              buzz_completed = 1,
+              message = NULL,
+              last_error = NULL,
+              updated_at = excluded.updated_at
+            """,
+            (
+                item.notification_id,
+                item.updated_at,
+                item.repository,
+                item.pull_number or 0,
+                self._now(),
+            ),
+        )
+        self.connection.commit()
+
     def record_coalesced(
         self,
         item: ResolvedNotification,

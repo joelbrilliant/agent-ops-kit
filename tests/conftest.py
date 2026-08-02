@@ -22,6 +22,7 @@ def config(tmp_path: Path) -> Config:
         buzz_channel="00000000-0000-0000-0000-000000000000",
         buzz_executable="buzz",
         batch_limit=20,
+        max_notification_age_hours=168,
     )
 
 

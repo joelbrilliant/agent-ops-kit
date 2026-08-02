@@ -21,6 +21,7 @@ _KEYS = {
     "buzz_channel",
     "buzz_executable",
     "batch_limit",
+    "max_notification_age_hours",
 }
 
 
@@ -39,6 +40,7 @@ class Config:
     buzz_channel: str
     buzz_executable: str
     batch_limit: int
+    max_notification_age_hours: int
 
 
 def load_config(path: str | Path) -> Config:
@@ -62,6 +64,11 @@ def load_config(path: str | Path) -> Config:
         buzz_channel=_channel(value),
         buzz_executable=_executable(value, "buzz_executable"),
         batch_limit=_positive_int(value, "batch_limit", 100),
+        max_notification_age_hours=_positive_int(
+            value,
+            "max_notification_age_hours",
+            24 * 90,
+        ),
     )
 
 

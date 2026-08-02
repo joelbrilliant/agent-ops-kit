@@ -45,7 +45,16 @@ class WatchLoop:
                 return RunResult(paused=True)
             self._drain_pending()
             processed = 0
-            for notification in self.github.list_notifications(self.config.batch_limit):
+            # GitHub normally returns newest first, but make that contract
+            # explicit before coalescing. One live PR inspection handles all
+            # notification rows already present for that PR in this poll.
+            notifications = sorted(
+                self.github.list_notifications(self.config.batch_limit),
+                key=lambda item: item.updated_at,
+                reverse=True,
+            )
+            handled_pulls: dict[tuple[str, int], StateRow] = {}
+            for notification in notifications:
                 try:
                     item = self.github.resolve(notification)
                 except Exception:
@@ -61,11 +70,28 @@ class WatchLoop:
                         self.state.record_unresolved(notification, message)
                         self._drain_pending()
                     continue
-                if self.state.terminal_for(item):
+                pull_key = (item.pull.repository.lower(), item.pull.number)
+                superseding = self.state.superseding_for(item)
+                if superseding is not None:
+                    processed += 1
+                    self.state.record_coalesced(item, superseding)
+                    self._drain_pending()
+                    handled_pulls.setdefault(pull_key, superseding)
+                    continue
+                terminal = self.state.terminal_for(item)
+                if terminal:
+                    handled_pulls.setdefault(pull_key, terminal)
+                    continue
+                prior = handled_pulls.get(pull_key)
+                if prior is not None:
+                    processed += 1
+                    self.state.record_coalesced(item, prior)
+                    self._drain_pending()
                     continue
                 processed += 1
                 if self._obsolete(item):
                     self._record_no_action(item)
+                    self._remember(item, handled_pulls)
                     continue
                 self.state.begin(item)
                 try:
@@ -73,6 +99,7 @@ class WatchLoop:
                 except Exception:
                     result = WorkerResult.blocked("Oscar could not run", "inspect the pull request and retry the bounded session")
                 self._record_worker_result(item, result)
+                self._remember(item, handled_pulls)
             return RunResult(processed=processed)
         finally:
             self.state.lock.release()
@@ -91,6 +118,18 @@ class WatchLoop:
     def _record_no_action(self, item: ResolvedNotification) -> None:
         self.state.record(item, "no_action", item.pull.head_sha)
         self._drain_pending()
+
+    def _remember(
+        self,
+        item: ResolvedNotification,
+        handled_pulls: dict[tuple[str, int], StateRow],
+    ) -> None:
+        row = self.state.get(
+            item.notification.notification_id,
+            item.notification.updated_at,
+        )
+        if row and row.outcome in {"no_action", "completed", "blocked"}:
+            handled_pulls[(item.pull.repository.lower(), item.pull.number)] = row
 
     def _record_worker_result(self, item: ResolvedNotification, result: WorkerResult) -> None:
         if result.outcome == "no_action":

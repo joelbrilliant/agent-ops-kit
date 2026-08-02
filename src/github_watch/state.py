@@ -75,6 +75,33 @@ class StateStore:
             return row
         return None
 
+    def superseding_for(self, item: ResolvedNotification) -> StateRow | None:
+        """Return newer terminal work for the same PR and current remote head."""
+        notification = item.notification
+        pull = item.pull
+        row = self.connection.execute(
+            """
+            SELECT * FROM notifications
+            WHERE lower(repository) = lower(?)
+              AND pull_number = ?
+              AND head_sha = ?
+              AND outcome IN ('no_action', 'completed', 'blocked')
+              AND source_updated_at >= ?
+              AND NOT (notification_id = ? AND source_updated_at = ?)
+            ORDER BY source_updated_at DESC
+            LIMIT 1
+            """,
+            (
+                pull.repository,
+                pull.number,
+                pull.head_sha,
+                notification.updated_at,
+                notification.notification_id,
+                notification.updated_at,
+            ),
+        ).fetchone()
+        return self._row(row) if row else None
+
     def begin(self, item: ResolvedNotification) -> None:
         self.connection.execute(
             """
@@ -126,6 +153,36 @@ class StateStore:
             VALUES (?, ?, ?, 0, '', 'blocked', ?, ?)
             """,
             (item.notification_id, item.updated_at, item.repository, message, self._now()),
+        )
+        self.connection.commit()
+
+    def record_coalesced(
+        self,
+        item: ResolvedNotification,
+        prior: StateRow,
+    ) -> None:
+        """Record a second notification from the same PR poll without rerunning Oscar."""
+        if prior.outcome not in {"no_action", "completed", "blocked"}:
+            raise ValueError("coalesced notification requires a terminal prior row")
+        self.connection.execute(
+            """
+            INSERT INTO notifications
+            (notification_id, source_updated_at, repository, pull_number,
+             head_sha, outcome, read_completed, buzz_completed, message,
+             last_error, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 1, NULL, NULL, ?)
+            ON CONFLICT(notification_id, source_updated_at) DO UPDATE SET
+              repository = excluded.repository,
+              pull_number = excluded.pull_number,
+              head_sha = excluded.head_sha,
+              outcome = excluded.outcome,
+              read_completed = 0,
+              buzz_completed = 1,
+              message = NULL,
+              last_error = NULL,
+              updated_at = excluded.updated_at
+            """,
+            self._values(item) + (prior.outcome, self._now()),
         )
         self.connection.commit()
 

@@ -265,6 +265,132 @@ def test_repeated_same_notification_update_does_not_repeat_actions(config):
     assert buzz.messages == []
 
 
+def test_same_pr_notifications_in_one_poll_run_one_oscar_and_one_buzz(config):
+    older = note(
+        notification_id="thread-old",
+        updated_at="2026-08-02T00:00:00Z",
+        kind="check",
+    )
+    newer = note(
+        notification_id="thread-new",
+        updated_at="2026-08-02T01:00:00Z",
+        kind="check",
+    )
+    github = FakeGitHub(
+        [older, newer],
+        {
+            older.notification_id: resolved(older),
+            newer.notification_id: resolved(newer),
+        },
+    )
+    worker = FakeWorker(
+        WorkerResult.completed("retriggered CI", "head-2", "issue", 44)
+    )
+    buzz = FakeBuzz()
+
+    result, store = run_loop(config, github, worker, buzz)
+
+    assert result.processed == 2
+    assert worker.calls == ["thread-new"]
+    assert [call for call in github.calls if call[0] == "mark"] == [
+        ("mark", "thread-new"),
+        ("mark", "thread-old"),
+    ]
+    assert buzz.messages == [
+        "Oscar completed acme/widget#7: retriggered CI. https://github.com/acme/widget/pull/7"
+    ]
+    older_row = store.get(older.notification_id, older.updated_at)
+    assert older_row.outcome == "completed"
+    assert older_row.read_completed is True
+    assert older_row.buzz_completed is True
+
+
+def test_blocked_same_pr_notifications_do_not_repeat_worker_or_buzz(config):
+    newer = note("thread-new", "2026-08-02T01:00:00Z")
+    older = note("thread-old", "2026-08-02T00:00:00Z")
+    github = FakeGitHub(
+        [newer, older],
+        {
+            newer.notification_id: resolved(newer),
+            older.notification_id: resolved(older),
+        },
+    )
+    worker = FakeWorker(
+        WorkerResult.blocked("Oscar timed out", "inspect the pull request")
+    )
+    buzz = FakeBuzz()
+    store = StateStore(config.state_dir)
+    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+
+    loop.run()
+    loop.run()
+
+    assert worker.calls == ["thread-new"]
+    assert len(buzz.messages) == 1
+    assert [call for call in github.calls if call[0] == "mark"] == []
+    assert store.get(older.notification_id, older.updated_at).outcome == "blocked"
+
+
+def test_new_notification_in_later_poll_still_gets_live_triage(config):
+    first = note("thread-first", "2026-08-02T00:00:00Z")
+    github = FakeGitHub(
+        [first],
+        {first.notification_id: resolved(first)},
+    )
+    worker = FakeWorker(
+        WorkerResult.completed("fixed first request", "head-2", "issue", 44),
+        WorkerResult.no_action("new comment already handled"),
+    )
+    buzz = FakeBuzz()
+    store = StateStore(config.state_dir)
+    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+
+    loop.run()
+    second = note("thread-second", "2026-08-02T02:00:00Z")
+    github.notifications = [second]
+    github.resolutions[second.notification_id] = resolved(second, head_sha="head-2")
+    loop.run()
+
+    assert worker.calls == ["thread-first", "thread-second"]
+    assert ("mark", "thread-second") in github.calls
+
+
+def test_newer_completed_work_supersedes_an_older_blocked_notification(config):
+    newer = note("thread-newer", "2026-08-02T02:00:00Z")
+    older = note("thread-older", "2026-08-02T01:00:00Z")
+    github = FakeGitHub(
+        [newer],
+        {newer.notification_id: resolved(newer)},
+    )
+    worker = FakeWorker(
+        WorkerResult.completed("fixed current head", "head-2", "issue", 44)
+    )
+    buzz = FakeBuzz()
+    store = StateStore(config.state_dir)
+    loop = WatchLoop(config, github, worker, store, buzz_send=buzz)
+
+    loop.run()
+    older_item = resolved(older, head_sha="head-2")
+    store.record(
+        older_item,
+        "blocked",
+        "head-2",
+        "Oscar is blocked on stale work",
+    )
+    store.set_buzz(store.get(older.notification_id, older.updated_at))
+    github.notifications = [older]
+    github.resolutions[older.notification_id] = older_item
+    loop.run()
+
+    row = store.get(older.notification_id, older.updated_at)
+    assert worker.calls == ["thread-newer"]
+    assert len(buzz.messages) == 1
+    assert row.outcome == "completed"
+    assert row.read_completed is True
+    assert row.buzz_completed is True
+    assert ("mark", "thread-older") in github.calls
+
+
 def test_same_notification_update_with_changed_head_does_not_repeat_actions(config):
     item = note()
     github = FakeGitHub([item], {item.notification_id: resolved(item)})
